@@ -108,10 +108,3 @@ A Helm chart or Kustomize overlay is recommended for production environments.
 
 ## License
 MIT (or any permissive license; TBD)
-
----
-
-## Name
-**eve** is the designated bot name.  
-No branding, mascot, or personality is implied.  
-Scope is operational and functional only.
