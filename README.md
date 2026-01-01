@@ -3,7 +3,9 @@ Slack-driven Kubernetes operations bot (Go, Socket Mode).
 Runs inside the cluster. Connects outward to Slack. Executes controlled actions against Kubernetes.  
 Optional integrations: GitHub Issue creation and Argo Workflows–based remediation.
 
-<img width="50%"  alt="image" src="https://github.com/user-attachments/assets/5e5a4fe5-60e6-46c5-a7aa-21e080be7a60" />
+<img width="50%" alt="image" src="https://github.com/user-attachments/assets/09b110dc-e775-4462-9e16-83c9d60f56eb" />
+
+
 
 ---
 
