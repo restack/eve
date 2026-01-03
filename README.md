@@ -1,289 +1,124 @@
-# eve
+# Eve: The Autonomous SRE Slack Gateway
 
-LLM-powered Kubernetes operations agent (Go, Socket Mode).  
-Runs inside the cluster. Connects to Slack. Routes requests through a local LLM to MCP-style tools.  
-Optional integrations: GitHub Issue creation and Argo Workflows remediation.
+**Eve** is a next-generation Kubernetes operations agent built in Go. It functions as an intelligent **MCP (Model Context Protocol) Proxy** that connects your Slack workspace to a local LLM and a modular ecosystem of MCP servers.
 
-<img width="50%" alt="image" src="https://github.com/user-attachments/assets/09b110dc-e775-4462-9e16-83c9d60f56eb" />
+Instead of hardcoding tools, Eve acts as a **Supervisor Agent** that dynamically discovers capabilities from external providers (Kubernetes, GitHub, Argo, etc.) and orchestrates them through natural language.
 
 ---
 
-## Overview
+## 🏗 Architecture
 
-Eve is an agentic Slack bot that:
-- Connects via Slack **Socket Mode** (no inbound endpoint required)
-- Operates as a Pod within a Kubernetes cluster
-- Routes all user messages through a **local LLM** (Ollama, vLLM, etc.)
-- LLM decides which **MCP-style tools** to invoke
-- Executes tools and returns formatted responses to Slack
+Eve sits at the intersection of your communication (Slack), your "brain" (Local LLM), and your tools (MCP Servers).
 
-**Architecture:**
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Kubernetes Cluster                       │
-│                                                                  │
-│  ┌────────────┐    ┌──────────────┐    ┌────────────────────┐   │
-│  │   Slack    │───▶│     Eve      │───▶│    Local LLM       │   │
-│  │ Socket Mode│◀───│   (Agent)    │◀───│ (Ollama/vLLM)      │   │
-│  └────────────┘    └──────┬───────┘    └────────────────────┘   │
-│                           │                                      │
-│                           ▼ Tool Calls                          │
-│         ┌─────────────────┼─────────────────┐                   │
-│         ▼                 ▼                 ▼                   │
-│  ┌────────────┐   ┌────────────┐   ┌────────────┐              │
-│  │ kubernetes │   │   github   │   │    argo    │              │
-│  │   tools    │   │   tools    │   │   tools    │              │
-│  └─────┬──────┘   └─────┬──────┘   └─────┬──────┘              │
-│        │                │                │                      │
-│        ▼                ▼                ▼                      │
-│   K8s API Server   GitHub API     Argo Workflows               │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    User([User in Slack]) <-->|Socket Mode| Eve[Eve Bot/Proxy]
+    Eve <-->|Tool Calls| LLM[LLM: Qwen3-Coder]
+    
+    subgraph "MCP Ecosystem (Sidecars/Services)"
+        Eve <-->|JSON-RPC| K8s[K8s MCP Server]
+        Eve <-->|JSON-RPC| GH[GitHub MCP Server]
+        Eve <-->|JSON-RPC| Argo[Argo MCP Server]
+    end
+    
+    K8s <-->|API| Cluster[K8s API Server]
+    GH <-->|API| GitHub[GitHub API]
+    Argo <-->|API| AW[Argo Workflows]
 ```
 
 ---
 
-## Features
+## 🚀 Key Features
 
-- **Natural Language Interface**: Ask questions in plain English
-  - "Show me all pods in the production namespace"
-  - "What's the status of the nginx deployment?"
-  - "Scale the api-server to 5 replicas"
-
-- **MCP-Style Tool Architecture**: Extensible tool interface
-  - Kubernetes operations (pods, deployments, nodes, events)
-  - GitHub issue creation and comments
-  - Argo Workflows execution
-
-- **Local LLM Integration**: No external API dependencies
-  - Supports Ollama (recommended)
-  - Supports any OpenAI-compatible API (vLLM, LocalAI, text-generation-webui)
-
-- **Access Control**: Restrict destructive operations
-  - Allowed user whitelist
-  - Allowed channel whitelist
+- **Philosophy: "Don't Reinvent the Wheel"**: Eve doesn't contain domain-specific logic. It focuses on the orchestration gateway, while domain logic is outsourced to standardized MCP servers.
+- **Dynamic Tool Discovery**: At startup, Eve performs a handshake with all configured MCP servers to list and register their tools.
+- **Agentic Supervisor**: Uses a ReAct-style loop to handle complex multi-step operations (e.g., "Find the failing pod, check its logs, and create a GitHub issue if it's an OOMKill").
+- **Local-First AI**: Optimized for local LLM execution. Default-configured for **Qwen3-Coder** via `llama-cpp` or `Ollama`.
+- **Zero-Ingress Security**: Uses Slack Socket Mode for outbound-only connections.
+- **Sidecar Optimized**: Designed to run in Kubernetes with MCP servers as sidecars for low latency and shared RBAC.
 
 ---
 
-## Quick Start
+## 🛠 Quick Start
 
-### 1. Prerequisites
+### 1. Configuration
 
-- Kubernetes cluster with in-cluster access
-- Local LLM server (Ollama recommended)
-- Slack App with Socket Mode enabled
+Eve can be configured via environment variables or a standard `mcp.json` file.
 
-### 2. Slack App Setup
-
-Create a Slack App at [api.slack.com/apps](https://api.slack.com/apps):
-
-1. Enable **Socket Mode** and get `xapp-` token
-2. Add **Bot Token Scopes**:
-   - `app_mentions:read`
-   - `chat:write`
-   - `commands`
-   - `im:history`
-   - `im:read`
-   - `im:write`
-3. Install to workspace and get `xoxb-` token
-4. (Optional) Add slash commands: `/k8s`, `/eve`
-
-### 3. Deploy
-
+**`.env` Configuration:**
 ```bash
-# Create namespace
-kubectl create namespace eve-system
+# Slack
+SLACK_APP_TOKEN=xapp-...
+SLACK_BOT_TOKEN=xoxb-...
 
-# Update secrets with your tokens
-kubectl apply -f manifests/base/secrets.yaml
+# LLM (OpenAI-Compatible endpoint)
+LLM_PROVIDER=openai
+LLM_BASE_URL=http://qwen.home.lab:8003
+LLM_MODEL=qwen3-coder
 
-# Deploy eve
-kubectl apply -k manifests/base/
+# MCP Servers (Comma-separated URLs)
+MCP_SERVERS=http://localhost:8080,http://localhost:8081
 ```
 
-### 4. Configure LLM
+**`mcp.json` Configuration:**
+```json
+{
+  "mcpServers": {
+    "kubernetes": { "url": "http://localhost:8080" },
+    "github": { "url": "http://localhost:8081" }
+  }
+}
+```
 
-Set the LLM endpoint in the ConfigMap:
+### 2. Deployment (Sidecar Pattern)
+
+The recommended way to deploy Eve is with the official `kubernetes-mcp-server` as a sidecar:
 
 ```yaml
-data:
-  LLM_PROVIDER: "openai"  # llama.cpp uses OpenAI-compatible API
-  LLM_BASE_URL: "http://qwen.home.lab:8003"
-  LLM_MODEL: "qwen3-coder"
-```
+# manifests/base/deployment.yaml
+containers:
+  - name: eve
+    image: harbor.home.lab/restack/eve:latest
+    env:
+      - name: MCP_SERVERS
+        value: "http://localhost:8080"
 
-Recommended models with tool calling support:
-- `qwen3-coder` (llama.cpp)
-- `qwen2.5:14b` (Ollama)
-- `llama3.1:8b` (Ollama)
-- `mistral:7b` (Ollama)
-
----
-
-## Configuration
-
-| Variable              | Description                                      | Default                  |
-|-----------------------|--------------------------------------------------|--------------------------|
-| `SLACK_APP_TOKEN`     | Socket Mode token (xapp-)                        | **required**             |
-| `SLACK_BOT_TOKEN`     | Bot token (xoxb-)                                | **required**             |
-| `LLM_PROVIDER`        | LLM provider: `ollama` or `openai`               | `ollama`                 |
-| `LLM_BASE_URL`        | LLM API base URL                                 | `http://localhost:11434` |
-| `LLM_MODEL`           | Model name                                       | `qwen2.5:14b`            |
-| `LLM_API_KEY`         | API key (for OpenAI-compatible)                  | -                        |
-| `GITHUB_TOKEN`        | GitHub PAT for issue creation                    | -                        |
-| `GITHUB_OWNER`        | GitHub org/user                                  | -                        |
-| `GITHUB_REPO`         | Repository for issues                            | -                        |
-| `ARGO_SERVER_URL`     | Argo Workflows API server                        | -                        |
-| `ARGO_AUTH_TOKEN`     | Argo authentication token                        | -                        |
-| `DEFAULT_NAMESPACE`   | Default K8s namespace                            | `default`                |
-| `ALLOWED_USER_IDS`    | Comma-separated Slack user IDs                   | -                        |
-| `ALLOWED_CHANNEL_IDS` | Comma-separated Slack channel IDs                | -                        |
-
----
-
-## MCP-Style Tool Interface
-
-Tools follow the Model Context Protocol pattern:
-
-```go
-type Tool struct {
-    Name                 string        // e.g., "kubernetes.list_pods"
-    Description          string        // Human-readable description
-    InputSchema          InputSchema   // JSON Schema for parameters
-    RequiresConfirmation bool          // Prompt before execution
-    IsDestructive        bool          // Marks state-changing operations
-    Handler              func(ctx, input) (*Result, error)
-}
-```
-
-### Available Tools
-
-**Kubernetes:**
-- `kubernetes.list_pods` - List pods in a namespace
-- `kubernetes.get_pod` - Get pod details
-- `kubernetes.list_nodes` - List cluster nodes
-- `kubernetes.list_deployments` - List deployments
-- `kubernetes.get_deployment` - Get deployment details
-- `kubernetes.rollout_status` - Check rollout status
-- `kubernetes.scale_deployment` 🔴 - Scale a deployment
-- `kubernetes.list_events` - List namespace events
-- `kubernetes.list_namespaces` - List namespaces
-
-**GitHub:**
-- `github.create_issue` - Create a GitHub issue
-- `github.comment_issue` - Comment on an issue
-- `github.list_issues` - List repository issues
-
-**Argo:**
-- `argo.run_workflow` 🔴 - Trigger a workflow
-- `argo.get_workflow` - Get workflow status
-- `argo.list_workflows` - List workflows
-
-🔴 = Destructive operation (requires authorization)
-
----
-
-## Adding Custom Tools
-
-1. Create a new package under `internal/tools/`:
-
-```go
-package mytool
-
-import (
-    "github.com/restack/eve/internal/tools"
-)
-
-type Tools struct {
-    toolsList []*tools.Tool
-}
-
-func NewTools(cfg *config.Config) *Tools {
-    t := &Tools{}
-    t.toolsList = []*tools.Tool{
-        t.myCustomTool(),
-    }
-    return t
-}
-
-func (t *Tools) All() []*tools.Tool { return t.toolsList }
-
-func (t *Tools) myCustomTool() *tools.Tool {
-    return &tools.Tool{
-        Name:        "mytool.action",
-        Description: "Performs a custom action",
-        InputSchema: tools.InputSchema{
-            Type: "object",
-            Properties: map[string]tools.Property{
-                "param1": {Type: "string", Description: "..."},
-            },
-            Required: []string{"param1"},
-        },
-        Handler: func(ctx context.Context, input json.RawMessage) (*tools.Result, error) {
-            // Implementation
-            return tools.NewSuccessResult("Done"), nil
-        },
-    }
-}
-```
-
-2. Register in `cmd/eve/main.go`:
-
-```go
-myTools := mytool.NewTools(cfg)
-for _, tool := range myTools.All() {
-    registry.Register(tool)
-}
+  - name: mcp-kubernetes
+    image: quay.io/podman/kubernetes-mcp-server:latest
+    args: ["--port=8080"]
 ```
 
 ---
 
-## RBAC
+## 🤖 Recommended LLM
 
-Eve requires scoped permissions:
-- **Read**: pods, deployments, nodes, events, namespaces
-- **Write** (optional): patch/update deployments
-- **Argo** (optional): create Workflow CRDs
+Eve is designed to work with models that have strong **Tool Calling (Functional Calling)** capabilities.
 
-See `manifests/base/rbac.yaml` for the complete RBAC configuration.
+- **Recommended**: `qwen3-coder` (Excellent at precise tool selection and SRE tasks).
+- **Alternative**: `qwen2.5:14b` or `llama3.1:8b` via Ollama.
 
 ---
 
-## Development
+## 📦 CI/CD
+
+Eve includes a production-ready GitHub Actions workflow (`.github/workflows/build-image.yml`) that:
+1. Builds a minimal Go binary into a scratch-based Docker image.
+2. Pushes to your private registry (**Harbor**).
+3. Automatically updates your GitOps manifests in your homelab repository.
+
+---
+
+## 🔧 Extensibility
+
+Adding a new capability to Eve is as simple as adding a new URL to your `MCP_SERVERS` list. Whether it's a Jira agent, a database explorer, or a custom internal tool, as long as it speaks **MCP**, Eve can use it.
 
 ```bash
-# Build
-go build -o eve ./cmd/eve
-
-# Run locally (requires kubeconfig and Slack tokens)
-export SLACK_APP_TOKEN=xapp-...
-export SLACK_BOT_TOKEN=xoxb-...
-export LLM_BASE_URL=http://localhost:11434
-export LLM_MODEL=qwen2.5:7b
-./eve
-
-# Build container
-docker build -t eve:latest .
+# Example: Adding a Jira MCP server
+export MCP_SERVERS="http://k8s-mcp:8080,http://jira-mcp:8080"
 ```
 
 ---
 
-## Agent Loop
+## ⚖️ License
 
-The agent follows a ReAct-style loop:
-
-1. Receive user message from Slack
-2. Send to LLM with system prompt and tool definitions
-3. If LLM returns tool calls:
-   - Execute each tool
-   - Append results to conversation
-   - Loop back to step 2
-4. If LLM returns final response:
-   - Send to Slack
-
-Maximum iterations: 10 (prevents infinite loops)
-
----
-
-## License
-
-MIT
+MIT © 2026 Restack / Eve Team
