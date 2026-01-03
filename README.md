@@ -4,6 +4,10 @@
 
 Instead of hardcoding tools, Eve acts as a **Supervisor Agent** that dynamically discovers capabilities from external providers (Kubernetes, GitHub, Argo, etc.) and orchestrates them through natural language.
 
+<p align="right">
+<img width="30%" alt="image" src="https://github.com/user-attachments/assets/222395a1-f4da-4e36-9bfa-d75f4c207a45" />
+</p>
+
 ---
 
 ## 🏗 Architecture
