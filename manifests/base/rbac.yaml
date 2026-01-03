@@ -1,0 +1,60 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eve-readonly
+  labels:
+    app.kubernetes.io/name: eve
+rules:
+  # Read-only access to core resources
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "endpoints", "namespaces", "nodes", "events", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  # Read-only access to apps resources
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  # Read-only access to batch resources
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eve-operator
+  labels:
+    app.kubernetes.io/name: eve
+rules:
+  # Includes all readonly permissions
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "endpoints", "namespaces", "nodes", "events", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  # Write access to deployments for scaling
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["patch", "update"]
+  # Delete pods for restart operations
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eve-operator-binding
+  labels:
+    app.kubernetes.io/name: eve
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eve-operator
+subjects:
+  - kind: ServiceAccount
+    name: eve
+    namespace: eve-system

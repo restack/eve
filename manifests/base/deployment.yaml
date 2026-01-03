@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eve
+  namespace: eve-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eve
+  template:
+    metadata:
+      labels:
+        app: eve
+    spec:
+      serviceAccountName: eve
+      containers:
+        # --- Eve: The Slack Agent & MCP Proxy ---
+        - name: eve
+          image: harbor.home.lab/restack/eve:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: eve-secrets
+            - configMapRef:
+                name: eve-config
+          env:
+            # Point Eve to the local sidecar MCP server
+            - name: MCP_SERVERS
+              value: "http://localhost:8080"
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+        # --- Kubernetes MCP Server (Sidecar) ---
+        # Ref: https://github.com/containers/kubernetes-mcp-server
+        - name: mcp-kubernetes
+          image: quay.io/podman/kubernetes-mcp-server:latest
+          ports:
+            - containerPort: 8080
+          # The MCP server uses Eve's ServiceAccount permissions
+          args:
+            - --port=8080
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
