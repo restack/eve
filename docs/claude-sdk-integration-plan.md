@@ -642,7 +642,603 @@ LLM_PROVIDER=ollama  # 즉시 로컬 LLM으로 전환
 
 ---
 
-## 11. 결론
+## 11. Claude-Mem 영구 메모리 연동
+
+### 11.1 Claude-Mem 개요
+
+[Claude-Mem](https://github.com/thedotmack/claude-mem)은 Claude 세션 간 컨텍스트를 영구적으로 보존하는 메모리 시스템입니다. Eve와 통합하면 다음과 같은 SRE 워크플로우 개선이 가능합니다.
+
+**핵심 기능:**
+- **영구 메모리**: 세션 종료 후에도 대화 컨텍스트 유지
+- **계층적 검색**: 토큰 효율적인 3단계 검색 워크플로우
+- **의미론적 검색**: Chroma 벡터 DB 기반 하이브리드 검색
+- **개인정보 제어**: `<private>` 태그로 민감 정보 제외
+
+**아키텍처:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Claude-Mem Stack                        │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
+│  │  SQLite DB  │  │  Chroma DB  │  │  Worker Service     │  │
+│  │  (Sessions, │  │  (Vector    │  │  (HTTP API on       │  │
+│  │   Summaries)│  │   Search)   │  │   port 37777)       │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 Eve + Claude-Mem 연동 시나리오
+
+#### 시나리오 1: 인시던트 히스토리 검색
+
+```
+사용자: "지난번에 OOMKilled 문제 어떻게 해결했지?"
+Eve: [claude-mem 검색] → 과거 해결 방법 컨텍스트 로드 → 답변 생성
+```
+
+#### 시나리오 2: 채널별 컨텍스트 유지
+
+```
+#sre-alerts 채널의 과거 인시던트 패턴 → 자동 연관 분석
+```
+
+#### 시나리오 3: 사용자별 선호도 기억
+
+```
+사용자 A: "항상 YAML 형식으로 보여줘" → 영구 저장 → 다음 세션에서 자동 적용
+```
+
+### 11.3 MCP 검색 도구 통합
+
+Claude-Mem은 3단계 검색 워크플로우로 토큰 사용량을 최적화합니다:
+
+| 도구 | 목적 | 토큰 비용 |
+|------|------|----------|
+| `mem.search` | 메모리 인덱스 검색 | ~50-100 토큰 |
+| `mem.timeline` | 시간적 컨텍스트 조회 | ~200-300 토큰 |
+| `mem.get_observations` | 상세 정보 조회 | ~500-1,000 토큰 |
+
+```go
+// internal/mcp/memory_client.go
+
+package mcp
+
+import (
+    "context"
+    "encoding/json"
+)
+
+// MemoryClient는 Claude-Mem MCP 서버와 통신합니다
+type MemoryClient struct {
+    *Client
+    baseURL string
+}
+
+func NewMemoryClient(baseURL string) *MemoryClient {
+    return &MemoryClient{
+        Client:  NewClient(baseURL),
+        baseURL: baseURL,
+    }
+}
+
+// Search는 메모리에서 관련 컨텍스트를 검색합니다
+func (m *MemoryClient) Search(ctx context.Context, query string, limit int) ([]MemoryEntry, error) {
+    resp, err := m.callRPC(ctx, "mem.search", map[string]interface{}{
+        "query": query,
+        "limit": limit,
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    var entries []MemoryEntry
+    json.Unmarshal(resp, &entries)
+    return entries, nil
+}
+
+// GetObservations는 특정 ID의 상세 관찰 데이터를 조회합니다
+func (m *MemoryClient) GetObservations(ctx context.Context, ids []string) ([]Observation, error) {
+    resp, err := m.callRPC(ctx, "mem.get_observations", map[string]interface{}{
+        "ids": ids,
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    var observations []Observation
+    json.Unmarshal(resp, &observations)
+    return observations, nil
+}
+
+// MemoryEntry는 검색 결과 항목입니다
+type MemoryEntry struct {
+    ID          string   `json:"id"`
+    Summary     string   `json:"summary"`
+    Timestamp   string   `json:"timestamp"`
+    SessionID   string   `json:"session_id"`
+    Technologies []string `json:"technologies"`
+    Score       float64  `json:"score"`
+}
+
+// Observation은 상세 관찰 데이터입니다
+type Observation struct {
+    ID        string                 `json:"id"`
+    Type      string                 `json:"type"`
+    Content   string                 `json:"content"`
+    Metadata  map[string]interface{} `json:"metadata"`
+    CreatedAt string                 `json:"created_at"`
+}
+```
+
+### 11.4 Eve 에이전트에 메모리 통합
+
+```go
+// internal/agent/memory_agent.go
+
+package agent
+
+import (
+    "context"
+    "fmt"
+    "log/slog"
+    "strings"
+
+    "github.com/restack/eve/internal/config"
+    "github.com/restack/eve/internal/llm"
+    "github.com/restack/eve/internal/mcp"
+    "github.com/restack/eve/internal/tools"
+)
+
+// MemoryAwareAgent는 영구 메모리를 활용하는 에이전트입니다
+type MemoryAwareAgent struct {
+    *Agent
+    memClient *mcp.MemoryClient
+}
+
+func NewMemoryAwareAgent(
+    llmClient llm.Client,
+    registry *tools.Registry,
+    cfg *config.Config,
+    memClient *mcp.MemoryClient,
+) *MemoryAwareAgent {
+    return &MemoryAwareAgent{
+        Agent:     NewAgent(llmClient, registry, cfg),
+        memClient: memClient,
+    }
+}
+
+// Process는 메모리 컨텍스트를 포함하여 요청을 처리합니다
+func (a *MemoryAwareAgent) Process(ctx context.Context, req *Request) (*Response, error) {
+    // 1. 관련 메모리 검색
+    memories, err := a.searchRelevantMemory(ctx, req)
+    if err != nil {
+        slog.Warn("memory search failed", "error", err)
+        // 메모리 실패해도 계속 진행
+    }
+
+    // 2. 시스템 프롬프트에 메모리 컨텍스트 추가
+    enhancedReq := a.enrichWithMemory(req, memories)
+
+    // 3. 기본 에이전트 로직 실행
+    return a.Agent.Process(ctx, enhancedReq)
+}
+
+func (a *MemoryAwareAgent) searchRelevantMemory(ctx context.Context, req *Request) ([]mcp.MemoryEntry, error) {
+    if a.memClient == nil {
+        return nil, nil
+    }
+
+    // 사용자 메시지 + 채널 컨텍스트로 검색
+    query := fmt.Sprintf("channel:%s %s", req.ChannelID, req.Message)
+
+    entries, err := a.memClient.Search(ctx, query, 5)
+    if err != nil {
+        return nil, err
+    }
+
+    // 관련성 높은 항목만 필터링
+    var relevant []mcp.MemoryEntry
+    for _, entry := range entries {
+        if entry.Score > 0.7 {
+            relevant = append(relevant, entry)
+        }
+    }
+
+    return relevant, nil
+}
+
+func (a *MemoryAwareAgent) enrichWithMemory(req *Request, memories []mcp.MemoryEntry) *Request {
+    if len(memories) == 0 {
+        return req
+    }
+
+    // 메모리 컨텍스트 문자열 생성
+    var memContext strings.Builder
+    memContext.WriteString("\n\n---\n[Relevant Past Context]\n")
+    for _, m := range memories {
+        memContext.WriteString(fmt.Sprintf("- [%s] %s\n", m.Timestamp, m.Summary))
+    }
+    memContext.WriteString("---\n")
+
+    // 메시지에 컨텍스트 추가
+    enrichedReq := *req
+    enrichedReq.Message = req.Message + memContext.String()
+
+    return &enrichedReq
+}
+```
+
+### 11.5 세션 관찰 저장
+
+Eve의 도구 실행 결과를 Claude-Mem에 자동 저장합니다:
+
+```go
+// internal/mcp/memory_writer.go
+
+package mcp
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "strings"
+    "time"
+
+    "github.com/restack/eve/internal/tools"
+)
+
+// MemoryWriter는 관찰 데이터를 메모리에 저장합니다
+type MemoryWriter struct {
+    endpoint   string
+    httpClient *http.Client
+    sessionID  string
+}
+
+func NewMemoryWriter(endpoint, sessionID string) *MemoryWriter {
+    return &MemoryWriter{
+        endpoint: endpoint,
+        httpClient: &http.Client{
+            Timeout: 10 * time.Second,
+        },
+        sessionID: sessionID,
+    }
+}
+
+// RecordToolExecution은 도구 실행 결과를 기록합니다
+func (w *MemoryWriter) RecordToolExecution(ctx context.Context, toolName string, input json.RawMessage, result *tools.Result) error {
+    observation := map[string]interface{}{
+        "type":       "tool_execution",
+        "session_id": w.sessionID,
+        "tool_name":  toolName,
+        "input":      string(input),
+        "output":     result.Output,
+        "success":    result.Success,
+        "timestamp":  time.Now().UTC().Format(time.RFC3339),
+        "metadata": map[string]interface{}{
+            "technologies": extractTechnologies(toolName, result.Output),
+        },
+    }
+
+    body, _ := json.Marshal(observation)
+    req, err := http.NewRequestWithContext(ctx, "POST", w.endpoint+"/api/observations", strings.NewReader(string(body)))
+    if err != nil {
+        return err
+    }
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := w.httpClient.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+        return fmt.Errorf("failed to record observation: %d", resp.StatusCode)
+    }
+
+    return nil
+}
+
+// RecordIncident는 인시던트 정보를 기록합니다
+func (w *MemoryWriter) RecordIncident(ctx context.Context, incident *Incident) error {
+    observation := map[string]interface{}{
+        "type":        "incident",
+        "session_id":  w.sessionID,
+        "title":       incident.Title,
+        "severity":    incident.Severity,
+        "namespace":   incident.Namespace,
+        "resource":    incident.Resource,
+        "description": incident.Description,
+        "resolution":  incident.Resolution,
+        "timestamp":   time.Now().UTC().Format(time.RFC3339),
+        "metadata": map[string]interface{}{
+            "technologies": incident.Technologies,
+            "duration_min": incident.DurationMinutes,
+        },
+    }
+
+    body, _ := json.Marshal(observation)
+    req, err := http.NewRequestWithContext(ctx, "POST", w.endpoint+"/api/observations", strings.NewReader(string(body)))
+    if err != nil {
+        return err
+    }
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := w.httpClient.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    return nil
+}
+
+// Incident는 인시던트 정보를 나타냅니다
+type Incident struct {
+    Title           string
+    Severity        string
+    Namespace       string
+    Resource        string
+    Description     string
+    Resolution      string
+    Technologies    []string
+    DurationMinutes int
+}
+
+// extractTechnologies는 도구 이름과 출력에서 기술 태그를 추출합니다
+func extractTechnologies(toolName, output string) []string {
+    techs := []string{}
+
+    // 도구 이름에서 기술 추출
+    if strings.HasPrefix(toolName, "kubernetes.") {
+        techs = append(techs, "kubernetes")
+    }
+    if strings.HasPrefix(toolName, "github.") {
+        techs = append(techs, "github")
+    }
+    if strings.HasPrefix(toolName, "argo.") {
+        techs = append(techs, "argo-workflows")
+    }
+
+    // 출력에서 추가 기술 감지
+    techKeywords := map[string]string{
+        "deployment":  "kubernetes-deployment",
+        "pod":         "kubernetes-pod",
+        "service":     "kubernetes-service",
+        "ingress":     "kubernetes-ingress",
+        "configmap":   "kubernetes-configmap",
+        "secret":      "kubernetes-secret",
+        "oomkilled":   "memory-issue",
+        "crashloop":   "crashloop",
+        "prometheus":  "prometheus",
+        "grafana":     "grafana",
+    }
+
+    lowerOutput := strings.ToLower(output)
+    for keyword, tech := range techKeywords {
+        if strings.Contains(lowerOutput, keyword) {
+            techs = append(techs, tech)
+        }
+    }
+
+    return techs
+}
+```
+
+### 11.6 Kubernetes 배포 구성
+
+Claude-Mem을 Eve와 함께 사이드카로 배포합니다:
+
+```yaml
+# manifests/base/deployment.yaml (업데이트)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eve
+  namespace: eve-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eve
+  template:
+    metadata:
+      labels:
+        app: eve
+    spec:
+      serviceAccountName: eve
+      containers:
+        # --- Eve: The Slack Agent & MCP Proxy ---
+        - name: eve
+          image: harbor.home.lab/restack/eve:latest
+          envFrom:
+            - secretRef:
+                name: eve-secrets
+          env:
+            - name: MCP_SERVERS
+              value: "http://localhost:8080,http://localhost:37777"
+            - name: MEMORY_ENDPOINT
+              value: "http://localhost:37777"
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+        # --- Kubernetes MCP Server (Sidecar) ---
+        - name: mcp-kubernetes
+          image: quay.io/podman/kubernetes-mcp-server:latest
+          ports:
+            - containerPort: 8080
+          args:
+            - --port=8080
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+        # --- Claude-Mem Worker (Sidecar) ---
+        - name: claude-mem
+          image: ghcr.io/thedotmack/claude-mem:latest
+          ports:
+            - containerPort: 37777
+          env:
+            - name: DATABASE_PATH
+              value: /data/memory.db
+            - name: CHROMA_PERSIST_DIR
+              value: /data/chroma
+          volumeMounts:
+            - name: memory-data
+              mountPath: /data
+          resources:
+            limits:
+              cpu: 200m
+              memory: 512Mi
+
+      volumes:
+        - name: memory-data
+          persistentVolumeClaim:
+            claimName: eve-memory-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: eve-memory-pvc
+  namespace: eve-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+### 11.7 환경 변수 추가
+
+```bash
+# .env.example 추가 내용
+
+# --- Claude-Mem Configuration ---
+MEMORY_ENABLED=true
+MEMORY_ENDPOINT=http://localhost:37777
+MEMORY_SEARCH_LIMIT=5
+MEMORY_MIN_RELEVANCE=0.7
+
+# --- Memory Recording ---
+RECORD_TOOL_EXECUTIONS=true
+RECORD_INCIDENTS=true
+```
+
+### 11.8 Config 업데이트
+
+```go
+// internal/config/config.go 추가
+
+type Config struct {
+    // 기존 필드들...
+
+    // Claude-Mem 설정
+    MemoryEnabled      bool
+    MemoryEndpoint     string
+    MemorySearchLimit  int
+    MemoryMinRelevance float64
+    RecordToolExecs    bool
+    RecordIncidents    bool
+}
+
+func Load() (*Config, error) {
+    cfg := &Config{
+        // 기존 설정...
+
+        // Memory 설정
+        MemoryEnabled:      os.Getenv("MEMORY_ENABLED") == "true",
+        MemoryEndpoint:     getEnvOrDefault("MEMORY_ENDPOINT", "http://localhost:37777"),
+        MemorySearchLimit:  getEnvIntOrDefault("MEMORY_SEARCH_LIMIT", 5),
+        MemoryMinRelevance: getEnvFloatOrDefault("MEMORY_MIN_RELEVANCE", 0.7),
+        RecordToolExecs:    os.Getenv("RECORD_TOOL_EXECUTIONS") == "true",
+        RecordIncidents:    os.Getenv("RECORD_INCIDENTS") == "true",
+    }
+    // ...
+}
+```
+
+### 11.9 활용 시나리오
+
+#### 시나리오 A: 반복 장애 패턴 감지
+
+```
+1. 사용자: "api-gateway가 또 죽었어"
+2. Eve: [메모리 검색] "api-gateway" 관련 과거 인시던트 조회
+3. 메모리: "지난 3번의 api-gateway 장애는 모두 메모리 부족으로 발생"
+4. Eve: "과거 기록을 보면 api-gateway는 메모리 부족으로 자주 죽습니다.
+        현재 메모리 사용량을 확인해보겠습니다..."
+```
+
+#### 시나리오 B: 해결책 재사용
+
+```
+1. 사용자: "prometheus가 느려"
+2. Eve: [메모리 검색] prometheus 성능 관련 과거 해결책
+3. 메모리: "2024-12-15: retention 기간을 30d→15d로 줄여 해결"
+4. Eve: "과거에 비슷한 문제가 있었습니다. retention 기간 조정으로
+        해결했던 기록이 있네요. 현재 설정을 확인해볼까요?"
+```
+
+#### 시나리오 C: 팀 지식 축적
+
+```
+시간이 지남에 따라 축적되는 지식:
+- 인시던트 해결 패턴
+- 클러스터별 특성
+- 자주 발생하는 문제와 해결책
+- 팀원별 선호하는 응답 형식
+```
+
+### 11.10 토큰 최적화 전략
+
+Claude-Mem의 3단계 검색으로 토큰 사용량을 최소화합니다:
+
+```go
+// internal/agent/memory_search.go
+
+// OptimizedMemorySearch는 단계적 검색으로 토큰을 최적화합니다
+func (a *MemoryAwareAgent) OptimizedMemorySearch(ctx context.Context, query string) ([]mcp.Observation, error) {
+    // Step 1: 인덱스 검색 (~50-100 토큰)
+    entries, err := a.memClient.Search(ctx, query, 10)
+    if err != nil {
+        return nil, err
+    }
+
+    if len(entries) == 0 {
+        return nil, nil
+    }
+
+    // Step 2: 상위 결과만 상세 조회 (~500-1000 토큰)
+    var ids []string
+    for i, entry := range entries {
+        if i >= 3 || entry.Score < 0.7 {
+            break
+        }
+        ids = append(ids, entry.ID)
+    }
+
+    observations, err := a.memClient.GetObservations(ctx, ids)
+    if err != nil {
+        return nil, err
+    }
+
+    return observations, nil
+}
+```
+
+**토큰 절약 효과:**
+- 기존: 모든 관련 데이터 로드 → ~5,000 토큰
+- 최적화: 인덱스 → 필터 → 상세조회 → ~600 토큰
+- **약 88% 토큰 절감**
+
+---
+
+## 12. 결론
 
 Claude SDK 통합은 Eve의 기능을 획기적으로 향상시킬 수 있는 전략적 투자입니다. 특히:
 
@@ -650,6 +1246,12 @@ Claude SDK 통합은 Eve의 기능을 획기적으로 향상시킬 수 있는 �
 2. **Extended Thinking**: 복잡한 SRE 문제에 대한 심층 분석
 3. **Vision**: 대시보드/로그 스크린샷 분석
 4. **하이브리드 접근**: 비용 최적화와 성능의 균형
+5. **영구 메모리 (Claude-Mem)**: 세션 간 컨텍스트 유지 및 팀 지식 축적
+
+Claude-Mem 연동을 통해 Eve는 단순한 질의응답 봇을 넘어, **학습하고 기억하는 SRE 동료**로 진화합니다:
+- 과거 인시던트 해결 경험 활용
+- 반복 장애 패턴 자동 감지
+- 팀 전체의 운영 지식 축적
 
 단계적 마이그레이션을 통해 리스크를 최소화하면서 Eve를 차세대 지능형 SRE 에이전트로 발전시킬 수 있습니다.
 
@@ -669,10 +1271,14 @@ go get github.com/anthropics/anthropic-sdk-go
 - [Claude Tool Use Guide](https://docs.anthropic.com/claude/docs/tool-use)
 - [Extended Thinking Guide](https://docs.anthropic.com/claude/docs/extended-thinking)
 - [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)
+- [Claude-Mem GitHub](https://github.com/thedotmack/claude-mem)
+- [Chroma Vector Database](https://www.trychroma.com/)
 
 ### C. 관련 파일 목록
 
 구현 시 수정이 필요한 파일:
+
+**Claude SDK 통합:**
 - `internal/llm/claude.go` (신규)
 - `internal/llm/types.go` (수정)
 - `internal/config/config.go` (수정)
@@ -680,3 +1286,66 @@ go get github.com/anthropics/anthropic-sdk-go
 - `internal/agent/router.go` (신규)
 - `cmd/eve/main.go` (수정)
 - `go.mod` (의존성 추가)
+
+**Claude-Mem 연동:**
+- `internal/mcp/memory_client.go` (신규)
+- `internal/mcp/memory_writer.go` (신규)
+- `internal/agent/memory_agent.go` (신규)
+- `internal/agent/memory_search.go` (신규)
+- `manifests/base/deployment.yaml` (수정 - 사이드카 추가)
+- `manifests/base/pvc.yaml` (신규 - 영구 스토리지)
+
+### D. Claude-Mem MCP 도구 스키마
+
+```json
+{
+  "tools": [
+    {
+      "name": "mem.search",
+      "description": "Search memory index for relevant context",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Natural language search query" },
+          "limit": { "type": "integer", "default": 10 }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "mem.timeline",
+      "description": "Get temporal context around an observation",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "observation_id": { "type": "string" },
+          "window_minutes": { "type": "integer", "default": 30 }
+        },
+        "required": ["observation_id"]
+      }
+    },
+    {
+      "name": "mem.get_observations",
+      "description": "Retrieve full details for specific observation IDs",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ids": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["ids"]
+      }
+    }
+  ]
+}
+```
+
+### E. 라이선스 고려사항
+
+| 컴포넌트 | 라이선스 | 상업적 사용 |
+|----------|----------|------------|
+| Eve | MIT | 가능 |
+| Claude SDK | Apache 2.0 | 가능 |
+| Claude-Mem | AGPL-3.0 | 수정 시 소스 공개 필요 |
+| Chroma DB | Apache 2.0 | 가능 |
+
+**주의**: Claude-Mem은 AGPL-3.0 라이선스로, 수정 후 네트워크 서비스로 배포 시 소스 코드 공개 의무가 있습니다. 상업적 사용 시 법적 검토가 필요합니다.
