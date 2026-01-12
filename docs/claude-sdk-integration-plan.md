@@ -1516,6 +1516,7 @@ go get github.com/anthropics/anthropic-sdk-go
 - [Chroma Vector Database](https://www.trychroma.com/)
 - [Qdrant Vector Database](https://qdrant.tech/)
 - [Qdrant Go Client](https://github.com/qdrant/go-client)
+- **[Eve Memory System Spec](./eve-memory-system-spec.md)** - Qdrant 기반 자체 구현 상세 스펙
 
 ### C. 관련 파일 목록
 
@@ -1596,5 +1597,6 @@ go get github.com/anthropics/anthropic-sdk-go
 | Claude SDK | Apache 2.0 | 가능 |
 | Claude-Mem | AGPL-3.0 | 수정 시 소스 공개 필요 |
 | Chroma DB | Apache 2.0 | 가능 |
+| **Qdrant** | **Apache 2.0** | **가능 (권장)** |
 
 **주의**: Claude-Mem은 AGPL-3.0 라이선스로, 수정 후 네트워크 서비스로 배포 시 소스 코드 공개 의무가 있습니다. 상업적 사용 시 법적 검토가 필요합니다.
