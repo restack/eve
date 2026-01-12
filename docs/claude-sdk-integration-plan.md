@@ -1194,7 +1194,248 @@ func Load() (*Config, error) {
 - 팀원별 선호하는 응답 형식
 ```
 
-### 11.10 토큰 최적화 전략
+### 11.10 벡터 DB 대안: Qdrant
+
+Claude-Mem은 기본적으로 Chroma DB를 사용하지만, **프로덕션 환경에서는 Qdrant가 더 적합**할 수 있습니다.
+
+#### Chroma vs Qdrant 비교
+
+| 항목 | Chroma | Qdrant |
+|------|--------|--------|
+| 구현 언어 | Python | Rust |
+| 프로덕션 준비도 | 프로토타이핑 적합 | 프로덕션 준비 완료 |
+| 확장성 | 제한적 (샤딩 미지원) | 수평 확장 지원 |
+| 필터링 | 기본 | 고급 필터링, 멀티테넌시 |
+| K8s 배포 | 복잡 | Helm 차트 제공 |
+| 메모리 최적화 | 제한적 | 양자화 지원 (8bit, binary) |
+
+#### Qdrant 기반 자체 구현
+
+Claude-Mem의 AGPL 라이선스 제약을 피하고 더 유연한 구현을 위해 Qdrant 기반 자체 메모리 시스템을 구축할 수 있습니다:
+
+```go
+// internal/memory/qdrant_client.go
+
+package memory
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "time"
+
+    pb "github.com/qdrant/go-client/qdrant"
+    "google.golang.org/grpc"
+)
+
+type QdrantMemory struct {
+    client     pb.PointsClient
+    collection string
+    embedder   Embedder
+}
+
+type Embedder interface {
+    Embed(ctx context.Context, text string) ([]float32, error)
+}
+
+func NewQdrantMemory(addr, collection string, embedder Embedder) (*QdrantMemory, error) {
+    conn, err := grpc.Dial(addr, grpc.WithInsecure())
+    if err != nil {
+        return nil, err
+    }
+
+    return &QdrantMemory{
+        client:     pb.NewPointsClient(conn),
+        collection: collection,
+        embedder:   embedder,
+    }, nil
+}
+
+// Store는 관찰 데이터를 벡터 DB에 저장합니다
+func (q *QdrantMemory) Store(ctx context.Context, obs *Observation) error {
+    // 텍스트를 벡터로 변환
+    vector, err := q.embedder.Embed(ctx, obs.Content)
+    if err != nil {
+        return err
+    }
+
+    // Qdrant에 저장
+    _, err = q.client.Upsert(ctx, &pb.UpsertPoints{
+        CollectionName: q.collection,
+        Points: []*pb.PointStruct{{
+            Id: &pb.PointId{PointIdOptions: &pb.PointId_Uuid{Uuid: obs.ID}},
+            Vectors: &pb.Vectors{
+                VectorsOptions: &pb.Vectors_Vector{
+                    Vector: &pb.Vector{Data: vector},
+                },
+            },
+            Payload: map[string]*pb.Value{
+                "type":       {Kind: &pb.Value_StringValue{StringValue: obs.Type}},
+                "content":    {Kind: &pb.Value_StringValue{StringValue: obs.Content}},
+                "session_id": {Kind: &pb.Value_StringValue{StringValue: obs.SessionID}},
+                "channel_id": {Kind: &pb.Value_StringValue{StringValue: obs.ChannelID}},
+                "timestamp":  {Kind: &pb.Value_StringValue{StringValue: obs.Timestamp}},
+            },
+        }},
+    })
+
+    return err
+}
+
+// Search는 유사한 관찰 데이터를 검색합니다
+func (q *QdrantMemory) Search(ctx context.Context, query string, limit int, filters map[string]string) ([]Observation, error) {
+    // 쿼리를 벡터로 변환
+    vector, err := q.embedder.Embed(ctx, query)
+    if err != nil {
+        return nil, err
+    }
+
+    // 필터 구성
+    var filter *pb.Filter
+    if len(filters) > 0 {
+        conditions := make([]*pb.Condition, 0, len(filters))
+        for key, value := range filters {
+            conditions = append(conditions, &pb.Condition{
+                ConditionOneOf: &pb.Condition_Field{
+                    Field: &pb.FieldCondition{
+                        Key: key,
+                        Match: &pb.Match{
+                            MatchValue: &pb.Match_Keyword{Keyword: value},
+                        },
+                    },
+                },
+            })
+        }
+        filter = &pb.Filter{Must: conditions}
+    }
+
+    // 검색 실행
+    resp, err := q.client.Search(ctx, &pb.SearchPoints{
+        CollectionName: q.collection,
+        Vector:         vector,
+        Limit:          uint64(limit),
+        Filter:         filter,
+        WithPayload:    &pb.WithPayloadSelector{SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true}},
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    // 결과 변환
+    var results []Observation
+    for _, point := range resp.Result {
+        obs := Observation{
+            ID:        point.Id.GetUuid(),
+            Score:     float64(point.Score),
+            Type:      point.Payload["type"].GetStringValue(),
+            Content:   point.Payload["content"].GetStringValue(),
+            SessionID: point.Payload["session_id"].GetStringValue(),
+            ChannelID: point.Payload["channel_id"].GetStringValue(),
+            Timestamp: point.Payload["timestamp"].GetStringValue(),
+        }
+        results = append(results, obs)
+    }
+
+    return results, nil
+}
+
+type Observation struct {
+    ID        string
+    Type      string
+    Content   string
+    SessionID string
+    ChannelID string
+    Timestamp string
+    Score     float64
+}
+```
+
+#### Qdrant Kubernetes 배포
+
+```yaml
+# manifests/base/qdrant.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant
+  namespace: eve-system
+spec:
+  serviceName: qdrant
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+    spec:
+      containers:
+        - name: qdrant
+          image: qdrant/qdrant:v1.7.4
+          ports:
+            - containerPort: 6333  # HTTP
+            - containerPort: 6334  # gRPC
+          volumeMounts:
+            - name: qdrant-storage
+              mountPath: /qdrant/storage
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: qdrant-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: eve-system
+spec:
+  selector:
+    app: qdrant
+  ports:
+    - name: http
+      port: 6333
+    - name: grpc
+      port: 6334
+```
+
+#### 임베딩 모델 선택
+
+| 모델 | 차원 | 특징 |
+|------|------|------|
+| `text-embedding-3-small` (OpenAI) | 1536 | 고품질, API 비용 |
+| `all-MiniLM-L6-v2` (Sentence Transformers) | 384 | 로컬 실행, 빠름 |
+| `nomic-embed-text` (Ollama) | 768 | 로컬 LLM과 통합 |
+
+```go
+// internal/memory/embedder.go
+
+// OllamaEmbedder는 로컬 Ollama를 사용한 임베딩 생성
+type OllamaEmbedder struct {
+    baseURL string
+    model   string
+}
+
+func (e *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+    req := map[string]string{
+        "model":  e.model,
+        "prompt": text,
+    }
+    // Ollama /api/embeddings 호출
+    // ...
+}
+```
+
+### 11.11 토큰 최적화 전략
 
 Claude-Mem의 3단계 검색으로 토큰 사용량을 최소화합니다:
 
@@ -1273,6 +1514,8 @@ go get github.com/anthropics/anthropic-sdk-go
 - [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)
 - [Claude-Mem GitHub](https://github.com/thedotmack/claude-mem)
 - [Chroma Vector Database](https://www.trychroma.com/)
+- [Qdrant Vector Database](https://qdrant.tech/)
+- [Qdrant Go Client](https://github.com/qdrant/go-client)
 
 ### C. 관련 파일 목록
 
@@ -1294,6 +1537,12 @@ go get github.com/anthropics/anthropic-sdk-go
 - `internal/agent/memory_search.go` (신규)
 - `manifests/base/deployment.yaml` (수정 - 사이드카 추가)
 - `manifests/base/pvc.yaml` (신규 - 영구 스토리지)
+
+**Qdrant 자체 구현 (대안):**
+- `internal/memory/qdrant_client.go` (신규)
+- `internal/memory/embedder.go` (신규)
+- `internal/memory/types.go` (신규)
+- `manifests/base/qdrant.yaml` (신규 - StatefulSet + Service)
 
 ### D. Claude-Mem MCP 도구 스키마
 
