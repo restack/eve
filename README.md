@@ -14,27 +14,38 @@ Instead of hardcoding tools, Eve acts as a **Supervisor Agent** that dynamically
 
 Eve sits at the intersection of your communication (Slack), your "brain" (Local LLM), and your tools (MCP Servers).
 
+### 1. Core Orchestration
+Eve acts as a secure gateway between your Slack workspace and technical tools.
+
 ```mermaid
 graph TD
     User([User in Slack]) <-->|Socket Mode| Eve[Eve Bot/Proxy]
     Eve <-->|Tool Calls| LLM[LLM: Qwen3-Coder]
 
-    subgraph "Memory System"
-        Eve <-->|STM: Sessions| SQLite[(SQLite)]
-        Eve <-->|LTM: Vector Search| Qdrant[(Qdrant)]
-    end
-
-    subgraph "MCP Ecosystem (Sidecars/Services)"
+    subgraph "MCP Ecosystem"
         Eve <-->|JSON-RPC| K8s[K8s MCP Server]
         Eve <-->|JSON-RPC| GH[GitHub MCP Server]
         Eve <-->|JSON-RPC| Argo[Argo MCP Server]
         Eve <-->|JSON-RPC| AWS[AWS MCP Servers]
     end
 
-    K8s <-->|API| Cluster[K8s API Server]
-    GH <-->|API| GitHub[GitHub API]
-    Argo <-->|API| AW[Argo Workflows]
-    AWS <-->|API| Cloud[AWS Cloud API]
+    K8s <-->|API Server| Cluster[...]
+    GH <-->|GitHub API| GitHub[...]
+    AWS <-->|Cloud API| Cloud[...]
+```
+
+### 2. Memory & Context System
+Eve maintains both short-term conversational context and long-term technical experience.
+
+```mermaid
+graph TD
+    Agent[Eve Agent] --> Store[Memory Store]
+    Store --> SQLite[(SQLite: Short-term Memory)]
+    Store --> Qdrant[(Qdrant: Long-term Memory)]
+    Store --> Embedder[Embedder: Ollama/OpenAI]
+
+    SQLite ---|Conversation History| Agent
+    Qdrant ---|Semantic Retrieval| Agent
 ```
 
 ---
