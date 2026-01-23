@@ -4,8 +4,8 @@
 
 Instead of hardcoding tools, Eve acts as a **Supervisor Agent** that dynamically discovers capabilities from external providers (Kubernetes, GitHub, Argo, etc.) and orchestrates them through natural language.
 
-<p align="right">
-<img width="30%" alt="image" src="https://github.com/user-attachments/assets/222395a1-f4da-4e36-9bfa-d75f4c207a45" />
+<p align="center">
+<img width="30%" alt="image" src="docs/assets/slack-bot-icon-b.png" />
 </p>
 
 ---
@@ -19,15 +19,22 @@ graph TD
     User([User in Slack]) <-->|Socket Mode| Eve[Eve Bot/Proxy]
     Eve <-->|Tool Calls| LLM[LLM: Qwen3-Coder]
 
+    subgraph "Memory System"
+        Eve <-->|STM: Sessions| SQLite[(SQLite)]
+        Eve <-->|LTM: Vector Search| Qdrant[(Qdrant)]
+    end
+
     subgraph "MCP Ecosystem (Sidecars/Services)"
         Eve <-->|JSON-RPC| K8s[K8s MCP Server]
         Eve <-->|JSON-RPC| GH[GitHub MCP Server]
         Eve <-->|JSON-RPC| Argo[Argo MCP Server]
+        Eve <-->|JSON-RPC| AWS[AWS MCP Servers]
     end
 
     K8s <-->|API| Cluster[K8s API Server]
     GH <-->|API| GitHub[GitHub API]
     Argo <-->|API| AW[Argo Workflows]
+    AWS <-->|API| Cloud[AWS Cloud API]
 ```
 
 ---
@@ -75,7 +82,8 @@ MCP_SERVERS=http://localhost:8080,http://localhost:8081
 {
   "mcpServers": {
     "kubernetes": { "url": "http://localhost:8080" },
-    "github": { "url": "http://localhost:8081" }
+    "github": { "url": "http://localhost:8081" },
+    "aws-billing": { "url": "http://aws-billing:8083" }
   }
 }
 ```
