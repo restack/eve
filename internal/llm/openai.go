@@ -25,7 +25,7 @@ func NewOpenAICompatibleClient(baseURL, model, apiKey string) *OpenAICompatibleC
 		model:   model,
 		apiKey:  apiKey,
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 300 * time.Second,
 		},
 	}
 }

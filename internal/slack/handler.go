@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 
 	"github.com/restack/eve/internal/agent"
@@ -20,13 +21,13 @@ import (
 type Handler struct {
 	client   *slack.Client
 	socket   *socketmode.Client
-	agent    *agent.Agent
+	agent    agent.Agent
 	registry *tools.Registry
 	cfg      *config.Config
 }
 
 // NewHandler creates a new Slack handler.
-func NewHandler(cfg *config.Config, ag *agent.Agent, registry *tools.Registry) (*Handler, error) {
+func NewHandler(cfg *config.Config, ag agent.Agent, registry *tools.Registry) (*Handler, error) {
 	client := slack.New(
 		cfg.SlackBotToken,
 		slack.OptionAppLevelToken(cfg.SlackAppToken),
@@ -160,26 +161,67 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 		return
 	}
 
+	// Determine reply thread: use existing thread or start a new one on the mention message
+	replyThread := event.ThreadTimeStamp
+	if replyThread == "" {
+		replyThread = event.TimeStamp
+	}
+
+	// Fetch thread context if this is a reply in an existing thread
+	var threadContext []string
+	if event.ThreadTimeStamp != "" {
+		// Get previous messages in this thread
+		params := &slack.GetConversationRepliesParameters{
+			ChannelID: event.Channel,
+			Timestamp: event.ThreadTimeStamp,
+			Limit:     20, // Limit to last 20 messages in thread
+		}
+		msgs, _, _, err := h.client.GetConversationReplies(params)
+		if err != nil {
+			slog.Warn("failed to fetch thread replies", "error", err)
+		} else {
+			for _, m := range msgs {
+				// Skip the current message
+				if m.Timestamp == event.TimeStamp {
+					continue
+				}
+				// Format: "username: message"
+				threadContext = append(threadContext, m.Text)
+			}
+		}
+	}
+
 	req := &agent.Request{
-		UserID:    event.User,
-		ChannelID: event.Channel,
-		Message:   message,
-		ThreadTS:  event.ThreadTimeStamp,
+		UserID:        event.User,
+		ChannelID:     event.Channel,
+		Message:       message,
+		ThreadTS:      replyThread,
+		ThreadContext: threadContext,
 	}
 
 	resp, err := h.agent.Process(ctx, req)
 	if err != nil {
 		slog.Error("agent error", "error", err)
-		h.sendMessage(event.Channel, fmt.Sprintf("❌ Error: %v", err))
+		h.sendThreadedMessage(event.Channel, replyThread, fmt.Sprintf("❌ Error: %v", err))
 		return
 	}
 
-	// Reply in thread if this was a threaded message
-	if event.ThreadTimeStamp != "" {
-		h.sendThreadedMessage(event.Channel, event.ThreadTimeStamp, resp.Text)
-	} else {
-		h.sendMessage(event.Channel, resp.Text)
+	// Log the response for debugging
+	slog.Info("sending response to slack",
+		"channel", event.Channel,
+		"thread", replyThread,
+		"response_length", len(resp.Text),
+		"response_preview", truncate(resp.Text, 100),
+	)
+
+	h.sendThreadedMessage(event.Channel, replyThread, resp.Text)
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
 	}
+	return s[:maxLen] + "..."
 }
 
 func (h *Handler) handleDirectMessage(ctx context.Context, event *slackevents.MessageEvent) {
@@ -309,24 +351,29 @@ func (h *Handler) handleRunRecipe(ctx context.Context, cb slack.InteractionCallb
 }
 
 func (h *Handler) sendMessage(channel, text string) {
-	_, _, err := h.client.PostMessage(channel, slack.MsgOptionText(text, false))
+	formattedText := formatForSlack(text)
+	_, _, err := h.client.PostMessage(channel, slack.MsgOptionText(formattedText, false))
 	if err != nil {
 		slog.Error("failed to send message", "error", err)
 	}
 }
 
 func (h *Handler) sendThreadedMessage(channel, threadTS, text string) {
-	_, _, err := h.client.PostMessage(channel,
-		slack.MsgOptionText(text, false),
+	formattedText := formatForSlack(text)
+	_, ts, err := h.client.PostMessage(channel,
+		slack.MsgOptionText(formattedText, false),
 		slack.MsgOptionTS(threadTS),
 	)
 	if err != nil {
-		slog.Error("failed to send threaded message", "error", err)
+		slog.Error("failed to send threaded message", "error", err, "channel", channel, "thread", threadTS)
+	} else {
+		slog.Info("message sent successfully", "channel", channel, "thread", threadTS, "message_ts", ts)
 	}
 }
 
 func (h *Handler) updateMessage(channel, ts, text string) {
-	_, _, _, err := h.client.UpdateMessage(channel, ts, slack.MsgOptionText(text, false))
+	formattedText := formatForSlack(text)
+	_, _, _, err := h.client.UpdateMessage(channel, ts, slack.MsgOptionText(formattedText, false))
 	if err != nil {
 		slog.Error("failed to update message", "error", err)
 	}
@@ -358,4 +405,38 @@ func (h *Handler) SendConfirmation(channel, toolName string, input map[string]in
 	if err != nil {
 		slog.Error("failed to send confirmation", "error", err)
 	}
+}
+
+var (
+	reHeader    = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
+	reEvePrefix = regexp.MustCompile(`(?mi)^Eve:\s*`)
+	// Match various fake tool call JSON patterns
+	reToolCallJSON  = regexp.MustCompile(`(?s)\{\s*"tool_name"[^}]+\}(\s*\})?`)
+	reFunctionCall  = regexp.MustCompile(`(?s)\{\s*"type"\s*:\s*"function"[^}]+\}(\s*\})*`)
+	reFunctionBlock = regexp.MustCompile(`(?s)\{\s*"type"\s*:\s*"function",\s*"function"\s*:\s*\{[^}]+\}[^}]*\}`)
+	reGenericTool   = regexp.MustCompile(`(?s)\{\s*"name"\s*:\s*"[^"]+",\s*"arguments"\s*:[^}]+\}`)
+)
+
+func formatForSlack(text string) string {
+	// 0. Remove "Eve:" prefix if present (LLM sometimes adds this)
+	text = reEvePrefix.ReplaceAllString(text, "")
+
+	// 1. Convert headers (# Header) to bold (*Header*)
+	text = reHeader.ReplaceAllString(text, "*$1*")
+
+	// 2. Convert standard markdown bold (**bold**) to slack bold (*bold*)
+	text = strings.ReplaceAll(text, "**", "*")
+
+	// 3. Ensure code blocks use triple backticks properly (Slack format)
+	// Replace ```language with just ``` for Slack compatibility
+	text = regexp.MustCompile("(?m)^```\\w*\n").ReplaceAllString(text, "```\n")
+
+	// 4. Remove fake tool call JSONs that LLM outputs when tools aren't being invoked properly
+	// This regex looks for JSON objects that contain tool-related keys
+	reAggressiveTool := regexp.MustCompile(`(?s)\n?\{\s*"(?:tool_name|name|function|arguments|type)"[^}]+\}(\s*\})*`)
+	text = reAggressiveTool.ReplaceAllString(text, "")
+
+	// 5. Clean up multiple newlines and trim
+	text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
+	return strings.TrimSpace(text)
 }

@@ -29,6 +29,9 @@ type Config struct {
 
 	// Recipe mappings
 	RecipeMappings map[string]string
+
+	// Memory system configuration
+	Memory *MemoryConfig
 }
 
 // Load reads configuration from environment variables.
@@ -42,9 +45,14 @@ func Load() (*Config, error) {
 		LLMAPIKey:     os.Getenv("LLM_API_KEY"),
 	}
 
+	// Track unique servers
+	serverMap := make(map[string]bool)
+
 	// Parse MCP servers from environment variable
 	if mcpServers := os.Getenv("MCP_SERVERS"); mcpServers != "" {
-		cfg.MCPServers = append(cfg.MCPServers, parseCSV(mcpServers)...)
+		for _, s := range parseCSV(mcpServers) {
+			serverMap[s] = true
+		}
 	}
 
 	// Also try to load from mcp.json if it exists
@@ -52,17 +60,32 @@ func Load() (*Config, error) {
 		if data, err := os.ReadFile(mcpJsonPath); err == nil {
 			var mcpConfig struct {
 				MCPServers map[string]struct {
-					URL string `json:"url"`
+					URL string            `json:"url"`
+					Env map[string]string `json:"env"`
 				} `json:"mcpServers"`
 			}
 			if err := json.Unmarshal(data, &mcpConfig); err == nil {
 				for _, server := range mcpConfig.MCPServers {
 					if server.URL != "" {
-						cfg.MCPServers = append(cfg.MCPServers, server.URL)
+						serverMap[server.URL] = true
+					}
+					// Apply environment variables from mcp.json if any
+					for k, v := range server.Env {
+						// Only set if not already set in environment
+						if os.Getenv(k) == "" {
+							// Expand variables like $HOME
+							expanded := os.ExpandEnv(v)
+							os.Setenv(k, expanded)
+						}
 					}
 				}
 			}
 		}
+	}
+
+	// Convert map back to slice
+	for url := range serverMap {
+		cfg.MCPServers = append(cfg.MCPServers, url)
 	}
 
 	// Parse allowed users/channels
@@ -88,6 +111,9 @@ func Load() (*Config, error) {
 	if cfg.SlackAppToken == "" || cfg.SlackBotToken == "" {
 		return nil, fmt.Errorf("SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required")
 	}
+
+	// Load memory configuration
+	cfg.Memory = LoadMemoryConfig()
 
 	return cfg, nil
 }

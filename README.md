@@ -18,17 +18,23 @@ Eve sits at the intersection of your communication (Slack), your "brain" (Local 
 graph TD
     User([User in Slack]) <-->|Socket Mode| Eve[Eve Bot/Proxy]
     Eve <-->|Tool Calls| LLM[LLM: Qwen3-Coder]
-    
+
     subgraph "MCP Ecosystem (Sidecars/Services)"
         Eve <-->|JSON-RPC| K8s[K8s MCP Server]
         Eve <-->|JSON-RPC| GH[GitHub MCP Server]
         Eve <-->|JSON-RPC| Argo[Argo MCP Server]
     end
-    
+
     K8s <-->|API| Cluster[K8s API Server]
     GH <-->|API| GitHub[GitHub API]
     Argo <-->|API| AW[Argo Workflows]
 ```
+
+---
+
+## 📸 Demo
+
+![Eve SRE Agent Demo](docs/assets/screenshot.png)
 
 ---
 

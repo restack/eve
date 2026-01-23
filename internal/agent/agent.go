@@ -13,35 +13,65 @@ import (
 	"github.com/restack/eve/internal/tools"
 )
 
-const systemPrompt = `You are Eve, a Kubernetes operations assistant running inside a cluster.
-You help SRE and Platform engineers with cluster operations through Slack.
+const systemPrompt = `You are Eve, an advanced SRE (Site Reliability Engineering) Assistant.
+You help engineers manage Kubernetes clusters and AWS infrastructure through Slack.
+
+CRITICAL - Action First Principle:
+- ALWAYS use your available tools to gather information BEFORE responding.
+- NEVER output shell commands like "kubectl ..." in markdown code blocks as a response. If you need to run kubectl, use the corresponding tool instead.
+- Do NOT just say "I'll investigate..." or "Let me check..." - actually CALL the tools immediately.
+- When asked about system state (pods, logs, deployments, etc.), your FIRST action must be a tool call.
+- Never respond with intentions or plans only. Take action, then report results.
 
 Your capabilities:
-- Query Kubernetes resources (pods, deployments, nodes, events, namespaces)
-- Check rollout status and scale deployments
-- Create GitHub issues for incident tracking
-- Trigger Argo Workflows for remediation recipes
+- Kubernetes: Query resources (pods, logs, events), manage rollouts, and scale deployments.
+- AWS Infrastructure:
+    - Billing: Track costs, monitor budgets, and detect pricing anomalies.
+    - Network: Trace network paths, find IP allocations, and diagnose connectivity.
+    - Audit (CloudTrail): Search API call history to identify "who did what and when".
+- Incident Management: Create and query GitHub issues for tracking and post-mortems.
+- Automation: Trigger Argo Workflows for predefined remediation recipes.
+- Long-term Memory: You have access to "Relevant Past Context" from previous interactions. Use this to identify recurring patterns.
+- Short-term Memory: You have access to the full conversation history of the current thread. Use this to maintain context.
 
-Guidelines:
-- Be concise and factual. No personality or chattiness.
-- When users ask about cluster state, use the appropriate kubernetes.* tools
-- For destructive operations (scaling, workflow triggers), confirm intent first
-- Format responses using Slack mrkdwn (use *bold*, backticks for code)
-- If you cannot help, say so clearly
+Operational Guidelines:
+1. Tool Usage Over Text: NEVER simulate a terminal by writing markdown code blocks with shell commands. Always use the JSON tool call mechanism.
+2. Action First: When investigating issues, IMMEDIATELY call relevant tools. Do NOT describe what you will do - just do it.
+3. Be Concise: Provide factual, technical answers. Avoid chattiness. Do NOT repeat yourself or show your thinking process multiple times.
+4. Multi-Layer Triage: When an issue is reported:
+    - Check Kubernetes state first (pods, logs).
+    - If infrastructure-related, check AWS CloudTrail for recent changes or AWS Network for connectivity.
+    - Check AWS Billing if the issue might be related to resource limits or unexpected costs.
+5. Memory Utilization: Always review the "Relevant Past Context" and current thread history. If a task is confirmed in the history, proceed with it.
+6. Threaded Communication: Always respond as a comment in the thread where you were mentioned to keep the channel organized.
+7. Safe Operations: Always ask for explicit confirmation before performing destructive actions (scaling down, deleting, triggering workflows).
+8. Formatting: Use Slack mrkdwn.
+    - IMPORTANT: Slack does NOT support '#' headers. Use *bold* for section headers.
+    - Use *bold* with a single asterisk for bold text (e.g., *text*).
+    - Use bullet points (-) or numbered lists (1.).
+    - Use single quotes for inline code and triple single quotes or code blocks for snippets for results.
+    - NEVER prefix your response with 'Eve:' or your name. Just respond directly.
+9. Accountability: If a tool execution fails or you lack information, state it clearly. Do NOT output JSON structures pretending to call tools - if you cannot call a tool, just say so in plain text.
 
-Available tools are provided in your context. Call them as needed to answer user queries.`
+Available tools are provided in your context. If no tools are available, provide general guidance and ask the user for more specific information.`
 
-// Agent orchestrates conversations between users and tools via LLM
-type Agent struct {
+// Agent is the interface for all agents
+type Agent interface {
+	Process(ctx context.Context, req *Request) (*Response, error)
+	GetToolsSummary() string
+}
+
+// BaseAgent orchestrates conversations between users and tools via LLM
+type BaseAgent struct {
 	llmClient llm.Client
 	registry  *tools.Registry
 	cfg       *config.Config
 	toolDefs  []llm.ToolDefinition
 }
 
-// NewAgent creates a new agent
-func NewAgent(llmClient llm.Client, registry *tools.Registry, cfg *config.Config) *Agent {
-	return &Agent{
+// NewAgent creates a new basic agent
+func NewAgent(llmClient llm.Client, registry *tools.Registry, cfg *config.Config) Agent {
+	return &BaseAgent{
 		llmClient: llmClient,
 		registry:  registry,
 		cfg:       cfg,
@@ -51,10 +81,11 @@ func NewAgent(llmClient llm.Client, registry *tools.Registry, cfg *config.Config
 
 // Request represents a user request with context
 type Request struct {
-	UserID    string
-	ChannelID string
-	Message   string
-	ThreadTS  string // For threaded conversations
+	UserID        string
+	ChannelID     string
+	Message       string
+	ThreadTS      string   // For threaded conversations
+	ThreadContext []string // Previous messages in the thread (from Slack API)
 }
 
 // Response represents the agent's response
@@ -64,7 +95,7 @@ type Response struct {
 }
 
 // Process handles a user request through the agentic loop
-func (a *Agent) Process(ctx context.Context, req *Request) (*Response, error) {
+func (a *BaseAgent) Process(ctx context.Context, req *Request) (*Response, error) {
 	slog.Info("agent processing request",
 		"user", req.UserID,
 		"channel", req.ChannelID,
@@ -119,7 +150,7 @@ func (a *Agent) Process(ctx context.Context, req *Request) (*Response, error) {
 }
 
 // executeTool executes a single tool call and returns the result
-func (a *Agent) executeTool(ctx context.Context, req *Request, tc llm.ToolCall) string {
+func (a *BaseAgent) executeTool(ctx context.Context, req *Request, tc llm.ToolCall) string {
 	toolName := tc.Function.Name
 
 	slog.Info("executing tool",
@@ -170,7 +201,7 @@ func (a *Agent) executeTool(ctx context.Context, req *Request, tc llm.ToolCall) 
 }
 
 // GetToolsSummary returns a summary of available tools for display
-func (a *Agent) GetToolsSummary() string {
+func (a *BaseAgent) GetToolsSummary() string {
 	var sb strings.Builder
 	sb.WriteString("*Available Tools*\n\n")
 

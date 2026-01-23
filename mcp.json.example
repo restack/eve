@@ -12,7 +12,7 @@
       "env": {
         "KUBECONFIG": "/home/user/.kube/config"
       },
-      "url": "http://localhost:8080"
+      "url": "http://localhost:8080/sse"
     },
     "github": {
       "command": "npx",
@@ -36,6 +36,15 @@
         "ARGO_TOKEN": "your_argo_token_here"
       },
       "url": "http://localhost:8082"
+    },
+    "aws-billing": {
+      "url": "http://aws-billing:8083"
+    },
+    "aws-network": {
+      "url": "http://aws-network:8084"
+    },
+    "aws-cloudtrail": {
+      "url": "http://aws-cloudtrail:8085"
     }
   }
 }

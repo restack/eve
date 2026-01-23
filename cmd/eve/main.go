@@ -13,6 +13,7 @@ import (
 	"github.com/restack/eve/internal/config"
 	"github.com/restack/eve/internal/llm"
 	"github.com/restack/eve/internal/mcp"
+	"github.com/restack/eve/internal/memory"
 	"github.com/restack/eve/internal/slack"
 	"github.com/restack/eve/internal/tools"
 )
@@ -47,6 +48,7 @@ func main() {
 
 	// Create and initialize tool registry
 	registry := tools.NewRegistry()
+	tools.RegisterKubernetesTools(registry) // Register fallback tools
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 	// Discover tools from configured MCP servers
@@ -68,8 +70,43 @@ func main() {
 
 	slog.Info("tool discovery complete", "total_tools", len(registry.List()))
 
+	// Initialize memory store if enabled
+	var memStore memory.MemoryStore = &memory.NoopMemoryStore{}
+	if cfg.Memory != nil && cfg.Memory.Enabled {
+		slog.Info("initializing memory store", "qdrant", cfg.Memory.QdrantAddr)
+
+		memCfg := &memory.Config{
+			QdrantAddr:       cfg.Memory.QdrantAddr,
+			QdrantCollection: cfg.Memory.QdrantCollection,
+			QdrantAPIKey:     cfg.Memory.QdrantAPIKey,
+			SQLitePath:       cfg.Memory.SQLitePath,
+			EmbedderType:     cfg.Memory.EmbedderType,
+			EmbedderModel:    cfg.Memory.EmbedderModel,
+			EmbedderBaseURL:  cfg.Memory.EmbedderURL,
+			EmbedderAPIKey:   cfg.Memory.EmbedderAPIKey,
+			SearchLimit:      cfg.Memory.SearchLimit,
+			MinScore:         cfg.Memory.MinScore,
+		}
+
+		store, err := memory.NewStore(memCfg)
+		if err != nil {
+			slog.Error("failed to initialize memory store", "error", err)
+			// Decide if this should be fatal. For now, degrad gracefully to Noop.
+		} else {
+			memStore = store
+			defer store.Close()
+		}
+	}
+
 	// Create agent
-	ag := agent.NewAgent(llmClient, registry, cfg)
+	var ag agent.Agent
+	if cfg.Memory != nil && cfg.Memory.Enabled {
+		slog.Info("creating memory-aware agent")
+		ag = agent.NewMemoryAgent(llmClient, registry, memStore, cfg)
+	} else {
+		slog.Info("creating basic agent")
+		ag = agent.NewAgent(llmClient, registry, cfg)
+	}
 
 	// Create Slack handler
 	handler, err := slack.NewHandler(cfg, ag, registry)
