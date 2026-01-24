@@ -1,11 +1,11 @@
-# Eve: The Autonomous SRE Slack Gateway
+# Eve: Your always-on SRE assistant for Slack
 
 **Eve** is a next-generation Kubernetes operations agent built in Go. It functions as an intelligent **MCP (Model Context Protocol) Proxy** that connects your Slack workspace to a local LLM and a modular ecosystem of MCP servers.
 
 Instead of hardcoding tools, Eve acts as a **Supervisor Agent** that dynamically discovers capabilities from external providers (Kubernetes, GitHub, Argo, etc.) and orchestrates them through natural language.
 
 <p align="center">
-<img width="30%" alt="image" src="docs/assets/eve-n-slime.png" />
+<img width="40%" alt="image" src="docs/assets/eve-n-slime.png" />
 </p>
 
 ---
@@ -59,13 +59,13 @@ graph TD
 ## 🚀 Key Features
 
 - **Philosophy: "Don't Reinvent the Wheel"**: Eve doesn't contain domain-specific logic. It focuses on the orchestration gateway, while domain logic is outsourced to standardized MCP servers.
-- **Dynamic Tool Discovery**: At startup, Eve performs a handshake with all configured MCP servers to list and register their tools.
 - **Agentic Supervisor**: Uses a ReAct-style loop to handle complex multi-step operations (e.g., "Find the failing pod, check its logs, and create a GitHub issue if it's an OOMKill").
 - **Agentic Delegation**: Minimizes direct command execution using slash commands in favor of delegating complex tasks to the agent via MCP and dynamic toolsets, allowing Eve to orchestrate actions autonomously.
-- **Local-First AI**: Optimized for local LLM execution. Default-configured for **Qwen3-Coder** via `llama-cpp` or `Ollama`.
-- **Zero-Ingress Security**: Uses Slack Socket Mode for outbound-only connections.
-- **Sidecar Optimized**: Designed to run in Kubernetes with MCP servers as sidecars for low latency and shared RBAC.
+- **Dynamic Tool Discovery**: At startup, Eve performs a handshake with all configured MCP servers to list and register their tools.
 - **Memory**: Maintains both short-term conversational context and long-term technical experience.
+- **Zero-Ingress Security**: Uses Slack Socket Mode for outbound-only connections.
+- **Local-First AI**: Optimized for local LLM execution. Default-configured for **Qwen3-Coder** via `llama-cpp` or `Ollama`.
+- **Sidecar Optimized**: Designed to run in Kubernetes with MCP servers as sidecars for low latency and shared RBAC.
 ---
 
 ## 🛠 Quick Start
