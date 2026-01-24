@@ -16,7 +16,7 @@ type Client interface {
 // ChatRequest represents a chat request to the LLM
 type ChatRequest struct {
 	Messages []Message        `json:"messages"`
-	Tools    []ToolDefinition `json:"tools,omitempty"`
+	Tools    []ToolDefinition `json:"tools"`
 	Model    string           `json:"model,omitempty"`
 }
 
@@ -66,18 +66,56 @@ func ConvertToolsToDefinitions(registry *tools.Registry) []ToolDefinition {
 	var defs []ToolDefinition
 	for _, name := range registry.List() {
 		tool, _ := registry.Get(name)
+
+		// Create a clean, token-efficient parameters map
+		properties := make(map[string]interface{})
+		for propName, prop := range tool.InputSchema.Properties {
+			pType := prop.Type
+			if pType == "" {
+				pType = "string" // Default to string if type is missing
+			}
+
+			p := map[string]interface{}{
+				"type": pType,
+			}
+			if prop.Description != "" {
+				p["description"] = prop.Description
+			}
+			if len(prop.Enum) > 0 {
+				p["enum"] = prop.Enum
+			}
+			properties[propName] = p
+		}
+
+		// Ensure required is never nil
+		required := tool.InputSchema.Required
+		if required == nil {
+			required = []string{}
+		}
+
+		// Default type to "object"
+		schemaType := tool.InputSchema.Type
+		if schemaType == "" {
+			schemaType = "object"
+		}
+
 		defs = append(defs, ToolDefinition{
 			Type: "function",
 			Function: Function{
 				Name:        tool.Name,
 				Description: tool.Description,
 				Parameters: map[string]interface{}{
-					"type":       tool.InputSchema.Type,
-					"properties": tool.InputSchema.Properties,
-					"required":   tool.InputSchema.Required,
+					"type":       schemaType,
+					"properties": properties,
+					"required":   required,
 				},
 			},
 		})
+	}
+
+	// Always return at least an empty slice, never nil
+	if defs == nil {
+		return []ToolDefinition{}
 	}
 	return defs
 }

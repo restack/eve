@@ -167,14 +167,17 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 		replyThread = event.TimeStamp
 	}
 
-	// Fetch thread context if this is a reply in an existing thread
+	// Add eyes reaction to indicate processing
+	h.client.AddReaction("eyes", slack.NewRefToMessage(event.Channel, event.TimeStamp))
+
+	// Fetch thread context ONLY if this is a reply in an existing thread
 	var threadContext []string
 	if event.ThreadTimeStamp != "" {
 		// Get previous messages in this thread
 		params := &slack.GetConversationRepliesParameters{
 			ChannelID: event.Channel,
 			Timestamp: event.ThreadTimeStamp,
-			Limit:     20, // Limit to last 20 messages in thread
+			Limit:     20, // Fetch up to 20 messages for deep context within a thread
 		}
 		msgs, _, _, err := h.client.GetConversationReplies(params)
 		if err != nil {
@@ -185,10 +188,12 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 				if m.Timestamp == event.TimeStamp {
 					continue
 				}
-				// Format: "username: message"
+				// Format: "message"
 				threadContext = append(threadContext, m.Text)
 			}
 		}
+	} else {
+		slog.Info("new thread started, skipping previous channel context")
 	}
 
 	req := &agent.Request{
@@ -235,6 +240,9 @@ func (h *Handler) handleDirectMessage(ctx context.Context, event *slackevents.Me
 		"user", event.User,
 		"channel", event.Channel,
 	)
+
+	// Add eyes reaction
+	h.client.AddReaction("eyes", slack.NewRefToMessage(event.Channel, event.TimeStamp))
 
 	req := &agent.Request{
 		UserID:    event.User,

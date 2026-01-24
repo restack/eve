@@ -64,6 +64,8 @@ graph TD
 - **Local-First AI**: Optimized for local LLM execution. Default-configured for **Qwen3-Coder** via `llama-cpp` or `Ollama`.
 - **Zero-Ingress Security**: Uses Slack Socket Mode for outbound-only connections.
 - **Sidecar Optimized**: Designed to run in Kubernetes with MCP servers as sidecars for low latency and shared RBAC.
+- **Memory**: Maintains both short-term conversational context and long-term technical experience.
+- **Agentic Delegation**: Minimizes direct command execution using slash commands in favor of delegating complex tasks to the agent via MCP and dynamic toolsets, allowing Eve to orchestrate actions autonomously.
 
 ---
 

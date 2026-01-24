@@ -34,6 +34,9 @@ type Tool struct {
 	// InputSchema defines the expected input parameters
 	InputSchema InputSchema `json:"input_schema"`
 
+	// RawInputSchema stores the original schema from MCP for direct LLM usage
+	RawInputSchema interface{} `json:"raw_input_schema,omitempty"`
+
 	// RequiresConfirmation indicates if the tool needs user confirmation
 	RequiresConfirmation bool `json:"requires_confirmation"`
 

@@ -102,7 +102,7 @@ func (a *MemoryAgent) Process(ctx context.Context, req *Request) (*Response, err
 
 func (a *MemoryAgent) searchMemory(ctx context.Context, query, channelID string) (*memory.SearchResult, error) {
 	opts := memory.SearchOptions{
-		Limit:          3, // Reduce limit for performance
+		Limit:          4, // Increase limit to 4 for better knowledge retrieval
 		MinScore:       0.7,
 		ChannelID:      channelID,
 		IncludeContent: false,
@@ -216,14 +216,55 @@ type ToolCallRecord struct {
 	Duration time.Duration
 }
 
+func (a *MemoryAgent) selectTools(message string) []llm.ToolDefinition {
+	msg := strings.ToLower(message)
+
+	// Keywords for each category
+	categories := map[string][]string{
+		"kubernetes": {"pod", "k8s", "deployment", "node", "namespace", "pvc", "service", "ingress", "rollout", "restart", "logs"},
+		"aws":        {"aws", "billing", "cost", "vpc", "network", "trace", "cloudtrail", "iam", "s3", "ec2", "rds"},
+		"incident":   {"incident", "issue", "github", "error", "failed", "crash", "outage", "problem"},
+		"argo":       {"workflow", "argo", "trigger", "remediate", "recipe"},
+	}
+
+	neededCategories := make(map[string]bool)
+	hasSreKeyword := false
+
+	// Simple keyword matching
+	for cat, keywords := range categories {
+		for _, kw := range keywords {
+			if strings.Contains(msg, kw) {
+				neededCategories[cat] = true
+				hasSreKeyword = true
+				break
+			}
+		}
+	}
+
+	// If no SRE keywords, it's likely a casual conversation. Return empty tools.
+	if !hasSreKeyword {
+		slog.Info("casual conversation detected, withholding tool schemas")
+		return []llm.ToolDefinition{}
+	}
+
+	// If it's an SRE query, we can either return all tools OR filter them.
+	// For now, let's return all tools if any keyword is matched to ensure capability,
+	// but we could filter by category name prefix as well.
+	slog.Info("SRE query detected, providing tool schemas", "matched_categories", len(neededCategories))
+	return a.toolDefs
+}
+
 func (a *MemoryAgent) runAgentLoop(ctx context.Context, req *Request, messages []llm.Message) (string, []*ToolCallRecord, error) {
 	var toolCalls []*ToolCallRecord
+
+	// Select relevant tools based on the message content
+	selectedTools := a.selectTools(req.Message)
 
 	maxIterations := 10
 	for i := 0; i < maxIterations; i++ {
 		chatReq := &llm.ChatRequest{
 			Messages: messages,
-			Tools:    a.toolDefs,
+			Tools:    selectedTools,
 		}
 
 		resp, err := a.llmClient.Chat(ctx, chatReq)
@@ -240,7 +281,7 @@ func (a *MemoryAgent) runAgentLoop(ctx context.Context, req *Request, messages [
 		} else {
 			// No tool calls, check if the LLM is "hallucinating" tool usage as text
 			content := strings.ToLower(resp.Message.Content)
-			if strings.Contains(content, "kubectl ") || strings.Contains(content, "aws ") {
+			if (strings.Contains(content, "kubectl ") || strings.Contains(content, "aws ")) && selectedTools != nil {
 				slog.Warn("LLM outputted commands as text instead of tool calls, retrying with feedback")
 				messages = append(messages, llm.Message{
 					Role:    "user",

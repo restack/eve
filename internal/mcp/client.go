@@ -142,9 +142,10 @@ func (c *Client) ListTools(ctx context.Context) ([]*tools.Tool, error) {
 		json.Unmarshal(schemaBytes, &eveSchema)
 
 		eveTools = append(eveTools, &tools.Tool{
-			Name:        mcpT.Name,
-			Description: mcpT.Description,
-			InputSchema: eveSchema,
+			Name:           mcpT.Name,
+			Description:    mcpT.Description,
+			InputSchema:    eveSchema,
+			RawInputSchema: mcpT.InputSchema, // Store original for LLM
 			Handler: func(ctx context.Context, input json.RawMessage) (*tools.Result, error) {
 				return c.CallTool(ctx, mcpT.Name, input)
 			},
