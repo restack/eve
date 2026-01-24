@@ -4,6 +4,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,6 +61,9 @@ func NewClient(serverURL string) *Client {
 	return &Client{
 		serverURL: serverURL,
 		httpClient: &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
 			Timeout: 60 * time.Second,
 		},
 	}

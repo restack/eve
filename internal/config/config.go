@@ -4,6 +4,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 )
@@ -64,7 +65,9 @@ func Load() (*Config, error) {
 					Env map[string]string `json:"env"`
 				} `json:"mcpServers"`
 			}
-			if err := json.Unmarshal(data, &mcpConfig); err == nil {
+			if err := json.Unmarshal(data, &mcpConfig); err != nil {
+				slog.Error("failed to parse mcp.json", "error", err)
+			} else {
 				for _, server := range mcpConfig.MCPServers {
 					if server.URL != "" {
 						serverMap[server.URL] = true

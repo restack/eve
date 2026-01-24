@@ -118,7 +118,7 @@ func (h *Handler) handleSlashCommand(ctx context.Context, cmd slack.SlashCommand
 	resp, err := h.agent.Process(ctx, req)
 	if err != nil {
 		slog.Error("agent error", "error", err)
-		h.sendMessage(cmd.ChannelID, fmt.Sprintf("❌ Error: %v", err))
+		h.sendErrorBlock(cmd.ChannelID, "", err.Error())
 		return
 	}
 
@@ -207,19 +207,21 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 	resp, err := h.agent.Process(ctx, req)
 	if err != nil {
 		slog.Error("agent error", "error", err)
-		h.sendThreadedMessage(event.Channel, replyThread, fmt.Sprintf("❌ Error: %v", err))
+		h.sendErrorBlock(event.Channel, replyThread, err.Error())
 		return
 	}
 
-	// Log the response for debugging
-	slog.Info("sending response to slack",
-		"channel", event.Channel,
-		"thread", replyThread,
-		"response_length", len(resp.Text),
-		"response_preview", truncate(resp.Text, 100),
-	)
+	// Build final response with tool call information
+	finalText := resp.Text
+	if len(resp.ToolCalls) > 0 {
+		toolSummary := "\n\n---\n*🛠 Executed Tools:*"
+		for _, tc := range resp.ToolCalls {
+			toolSummary += fmt.Sprintf("\n• `%s` (Input: `%s`)", tc.ToolName, tc.Input)
+		}
+		finalText += toolSummary
+	}
 
-	h.sendThreadedMessage(event.Channel, replyThread, resp.Text)
+	h.sendThreadedMessage(event.Channel, replyThread, finalText)
 }
 
 func truncate(s string, maxLen int) string {
@@ -254,7 +256,7 @@ func (h *Handler) handleDirectMessage(ctx context.Context, event *slackevents.Me
 	resp, err := h.agent.Process(ctx, req)
 	if err != nil {
 		slog.Error("agent error", "error", err)
-		h.sendMessage(event.Channel, fmt.Sprintf("❌ Error: %v", err))
+		h.sendErrorBlock(event.Channel, event.ThreadTimeStamp, err.Error())
 		return
 	}
 
@@ -387,6 +389,29 @@ func (h *Handler) updateMessage(channel, ts, text string) {
 	}
 }
 
+func (h *Handler) sendErrorBlock(channel, threadTS, errorMessage string) {
+	blocks := []slack.Block{
+		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "⚠️ Execution Error", false, false)),
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Message:* %s", truncate(errorMessage, 500)), false, false),
+			nil, nil,
+		),
+		slack.NewContextBlock("error_footer",
+			slack.NewTextBlockObject("mrkdwn", "_Please check the logs for more details or try a different query._", false, false),
+		),
+	}
+
+	options := []slack.MsgOption{slack.MsgOptionBlocks(blocks...)}
+	if threadTS != "" {
+		options = append(options, slack.MsgOptionTS(threadTS))
+	}
+
+	_, _, err := h.client.PostMessage(channel, options...)
+	if err != nil {
+		slog.Error("failed to send error block", "error", err)
+	}
+}
+
 // SendConfirmation sends a confirmation dialog for destructive actions
 func (h *Handler) SendConfirmation(channel, toolName string, input map[string]interface{}) {
 	payload, _ := json.Marshal(map[string]interface{}{
@@ -418,15 +443,10 @@ func (h *Handler) SendConfirmation(channel, toolName string, input map[string]in
 var (
 	reHeader    = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
 	reEvePrefix = regexp.MustCompile(`(?mi)^Eve:\s*`)
-	// Match various fake tool call JSON patterns
-	reToolCallJSON  = regexp.MustCompile(`(?s)\{\s*"tool_name"[^}]+\}(\s*\})?`)
-	reFunctionCall  = regexp.MustCompile(`(?s)\{\s*"type"\s*:\s*"function"[^}]+\}(\s*\})*`)
-	reFunctionBlock = regexp.MustCompile(`(?s)\{\s*"type"\s*:\s*"function",\s*"function"\s*:\s*\{[^}]+\}[^}]*\}`)
-	reGenericTool   = regexp.MustCompile(`(?s)\{\s*"name"\s*:\s*"[^"]+",\s*"arguments"\s*:[^}]+\}`)
 )
 
 func formatForSlack(text string) string {
-	// 0. Remove "Eve:" prefix if present (LLM sometimes adds this)
+	// 0. Remove "Eve:" prefix if present
 	text = reEvePrefix.ReplaceAllString(text, "")
 
 	// 1. Convert headers (# Header) to bold (*Header*)
@@ -435,16 +455,23 @@ func formatForSlack(text string) string {
 	// 2. Convert standard markdown bold (**bold**) to slack bold (*bold*)
 	text = strings.ReplaceAll(text, "**", "*")
 
-	// 3. Ensure code blocks use triple backticks properly (Slack format)
-	// Replace ```language with just ``` for Slack compatibility
+	// 3. Ensure code blocks use triple backticks properly
 	text = regexp.MustCompile("(?m)^```\\w*\n").ReplaceAllString(text, "```\n")
 
-	// 4. Remove fake tool call JSONs that LLM outputs when tools aren't being invoked properly
-	// This regex looks for JSON objects that contain tool-related keys
+	// 4. Remove fake tool call JSONs and the surrounding code blocks that LLM outputs
+	// Matches ```json { ... } ``` or just { ... } variations
+	reCodeBlockJSON := regexp.MustCompile("(?s)[\\n\\s]*`{3}(?:json)?\\s*[\\n\\s]*\\{\\s*\"(?:tool_name|name|function|arguments|type)\"[\\s\\S]*?\\}\\s*[\\n\\s]*`{3}[\\n\\s]*")
+	text = reCodeBlockJSON.ReplaceAllString(text, "\n")
+
+	// Fallback for JSON without code blocks
 	reAggressiveTool := regexp.MustCompile(`(?s)\n?\{\s*"(?:tool_name|name|function|arguments|type)"[^}]+\}(\s*\})*`)
+	reToolArray := regexp.MustCompile(`(?s)\[\s*\{\s*"(?:tool_name|name|function|arguments|type)"[\s\S]*?\}\s*\]`)
+	text = reToolArray.ReplaceAllString(text, "")
 	text = reAggressiveTool.ReplaceAllString(text, "")
 
-	// 5. Clean up multiple newlines and trim
+	// 5. Clean up dangling tool-call shards and excess whitespace
+	text = regexp.MustCompile(`(?m)^\s*[\[\]]\s*$`).ReplaceAllString(text, "")
 	text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
+
 	return strings.TrimSpace(text)
 }

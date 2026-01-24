@@ -827,10 +827,11 @@ type qdrantCreds struct {
 
 func (c qdrantCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
 	return map[string]string{
-		"api-key": c.apiKey,
+		"api-key":       c.apiKey,
+		"authorization": "Bearer " + c.apiKey,
 	}, nil
 }
 
 func (c qdrantCreds) RequireTransportSecurity() bool {
-	return false // API key can be sent over insecure gRPC if needed, but usually used with TLS
+	return false // Allow sending credentials even if the underlying connection isn't TLS (useful for local proxies)
 }

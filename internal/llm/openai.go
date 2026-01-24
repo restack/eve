@@ -31,10 +31,11 @@ func NewOpenAICompatibleClient(baseURL, model, apiKey string) *OpenAICompatibleC
 }
 
 type openAIRequest struct {
-	Model    string           `json:"model"`
-	Messages []Message        `json:"messages"`
-	Tools    []ToolDefinition `json:"tools,omitempty"`
-	Stream   bool             `json:"stream"`
+	Model      string           `json:"model"`
+	Messages   []Message        `json:"messages"`
+	Tools      []ToolDefinition `json:"tools,omitempty"`
+	ToolChoice interface{}      `json:"tool_choice,omitempty"` // "auto", "none", "required"
+	Stream     bool             `json:"stream"`
 }
 
 type openAIResponse struct {
@@ -54,10 +55,11 @@ func (c *OpenAICompatibleClient) Chat(ctx context.Context, req *ChatRequest) (*C
 	}
 
 	openAIReq := openAIRequest{
-		Model:    model,
-		Messages: req.Messages,
-		Tools:    req.Tools,
-		Stream:   false,
+		Model:      model,
+		Messages:   req.Messages,
+		Tools:      req.Tools,
+		ToolChoice: req.ToolChoice,
+		Stream:     false,
 	}
 
 	body, err := json.Marshal(openAIReq)
