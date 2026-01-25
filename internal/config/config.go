@@ -33,6 +33,22 @@ type Config struct {
 
 	// Memory system configuration
 	Memory *MemoryConfig
+
+	// LLM Sampling configuration
+	Sampling *LLMSamplingConfig
+}
+
+// LLMSamplingConfig holds parameters for LLM text generation
+type LLMSamplingConfig struct {
+	Temperature      *float64
+	TopP             *float64
+	TopK             *int
+	MaxTokens        *int
+	PresencePenalty  *float64
+	FrequencyPenalty *float64
+	Seed             *int
+	MinP             *float64
+	TypicalP         *float64
 }
 
 // Load reads configuration from environment variables.
@@ -118,7 +134,48 @@ func Load() (*Config, error) {
 	// Load memory configuration
 	cfg.Memory = LoadMemoryConfig()
 
+	// Load sampling configuration
+	cfg.Sampling = loadSamplingConfig()
+
 	return cfg, nil
+}
+
+func loadSamplingConfig() *LLMSamplingConfig {
+	return &LLMSamplingConfig{
+		Temperature:      getEnvFloat64Ptr("LLM_TEMPERATURE"),
+		TopP:             getEnvFloat64Ptr("LLM_TOP_P"),
+		TopK:             getEnvIntPtr("LLM_TOP_K"),
+		MaxTokens:        getEnvIntPtr("LLM_MAX_TOKENS"),
+		PresencePenalty:  getEnvFloat64Ptr("LLM_PRESENCE_PENALTY"),
+		FrequencyPenalty: getEnvFloat64Ptr("LLM_FREQUENCY_PENALTY"),
+		Seed:             getEnvIntPtr("LLM_SEED"),
+		MinP:             getEnvFloat64Ptr("LLM_MIN_P"),
+		TypicalP:         getEnvFloat64Ptr("LLM_TYPICAL_P"),
+	}
+}
+
+func getEnvFloat64Ptr(key string) *float64 {
+	val := os.Getenv(key)
+	if val == "" {
+		return nil
+	}
+	var f float64
+	if _, err := fmt.Sscanf(val, "%f", &f); err != nil {
+		return nil
+	}
+	return &f
+}
+
+func getEnvIntPtr(key string) *int {
+	val := os.Getenv(key)
+	if val == "" {
+		return nil
+	}
+	var i int
+	if _, err := fmt.Sscanf(val, "%d", &i); err != nil {
+		return nil
+	}
+	return &i
 }
 
 // IsUserAllowed checks authorization

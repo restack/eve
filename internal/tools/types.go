@@ -45,6 +45,9 @@ type Tool struct {
 
 	// Handler is the function that executes the tool
 	Handler func(ctx context.Context, input json.RawMessage) (*Result, error) `json:"-"`
+
+	// Source is the name or URL of the MCP server that provided this tool
+	Source string `json:"source,omitempty"`
 }
 
 // Result represents the output of a tool execution.

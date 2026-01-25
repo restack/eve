@@ -61,8 +61,19 @@ func (r *Registry) LoadFromMCP(ctx context.Context, mcpClient interface {
 func (r *Registry) Get(name string) (*Tool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	tool, ok := r.tools[name]
-	return tool, ok
+
+	// Try exact match
+	if tool, ok := r.tools[name]; ok {
+		return tool, ok
+	}
+
+	// Try underscore-to-dot match (for LLM compatibility)
+	dotName := strings.ReplaceAll(name, "_", ".")
+	if tool, ok := r.tools[dotName]; ok {
+		return tool, ok
+	}
+
+	return nil, false
 }
 
 // List returns all registered tool names sorted alphabetically.
@@ -99,20 +110,22 @@ func (r *Registry) Execute(ctx context.Context, name string, input json.RawMessa
 		return nil, fmt.Errorf("tool not found: %s", name)
 	}
 
+	actualName := tool.Name // Use the registered name
+
 	slog.Info("executing tool",
-		"name", name,
+		"name", actualName,
 		"requires_confirmation", tool.RequiresConfirmation,
 		"is_destructive", tool.IsDestructive,
 	)
 
 	result, err := tool.Handler(ctx, input)
 	if err != nil {
-		slog.Error("tool execution failed", "name", name, "error", err)
+		slog.Error("tool execution failed", "name", actualName, "error", err)
 		return NewErrorResult(err.Error()), nil
 	}
 
 	slog.Info("tool execution completed",
-		"name", name,
+		"name", actualName,
 		"success", result.Success,
 	)
 

@@ -3,6 +3,8 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"strings"
 
 	"github.com/restack/eve/internal/tools"
@@ -20,6 +22,20 @@ type ChatRequest struct {
 	Tools      []ToolDefinition `json:"tools"`
 	Model      string           `json:"model,omitempty"`
 	ToolChoice interface{}      `json:"tool_choice,omitempty"` // "auto", "none", "required"
+
+	// Sampling parameters
+	Temperature      *float64 `json:"temperature,omitempty"`
+	TopP             *float64 `json:"top_p,omitempty"`
+	TopK             *int     `json:"top_k,omitempty"`
+	MaxTokens        *int     `json:"max_tokens,omitempty"`
+	PresencePenalty  *float64 `json:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+	Seed             *int     `json:"seed,omitempty"`
+	MinP             *float64 `json:"min_p,omitempty"`
+	TypicalP         *float64 `json:"typical_p,omitempty"`
+
+	// Generic extra body for provider-specific parameters
+	ExtraBody map[string]interface{} `json:"extra_body,omitempty"`
 }
 
 // Message represents a chat message
@@ -52,9 +68,9 @@ type ToolDefinition struct {
 
 // Function defines a callable function
 type Function struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	Parameters  interface{} `json:"parameters"` // JSON Schema
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"` // JSON Schema
 }
 
 // ChatResponse represents the LLM response
@@ -63,37 +79,46 @@ type ChatResponse struct {
 	FinishReason string  `json:"finish_reason"` // "stop", "tool_calls"
 }
 
-// sanitizeJinja2Patterns escapes Jinja2-like patterns that would cause
-// vLLM's internal template engine to fail.
+// sanitizeJinja2Patterns escapes Jinja2-like patterns and cleans text for LLM templates.
 func sanitizeJinja2Patterns(input string) string {
 	if input == "" {
-		return ""
+		return "parameter"
 	}
-	// Replace newlines and tabs with spaces to prevent breaking LLM server JSON/Jinja2 templates
 	s := strings.NewReplacer(
 		"\n", " ",
 		"\r", " ",
 		"\t", " ",
-		"{{", "{ {",
-		"}}", "} }",
-		"{%", "{ %",
-		"%}", "% }",
-		"{#", "{ #",
-		"#}", "# }",
+		"{{", "(",
+		"}}", ")",
+		"{%", "[",
+		"%}", "]",
+		"{#", "<",
+		"#}", ">",
 	).Replace(input)
 
-	// Trim multiple spaces
-	return strings.Join(strings.Fields(s), " ")
+	result := strings.Join(strings.Fields(s), " ")
+	if result == "" {
+		return "parameter"
+	}
+	return result
 }
 
-// createMinimalSchema creates a minimal, vLLM-safe schema from any input.
-// This ensures that 'properties' is NEVER null, which is the primary cause of vLLM 500 errors.
+// createMinimalSchema creates the MOST MINIMAL schema to avoid llama.cpp Jinja2 crashes.
+// It ONLY includes 'type' and 'description' for each property - nothing else.
 func createMinimalSchema(input interface{}) map[string]interface{} {
-	// Initialize with guaranteed non-null fields
+	// Absolutely minimal result structure - ALWAYS return a valid schema
+	// CRITICAL: properties must NEVER be null, empty map is OK
+	defaultProps := map[string]interface{}{
+		"_placeholder": map[string]interface{}{
+			"type":        "string",
+			"description": "placeholder parameter",
+		},
+	}
+
 	result := map[string]interface{}{
 		"type":       "object",
-		"properties": make(map[string]interface{}),
-		"required":   make([]string, 0),
+		"properties": defaultProps,
+		"required":   []string{},
 	}
 
 	if input == nil {
@@ -105,53 +130,92 @@ func createMinimalSchema(input interface{}) map[string]interface{} {
 		return result
 	}
 
-	// Extract and rebuild properties
-	if props, ok := m["properties"].(map[string]interface{}); ok && props != nil {
-		newProps := make(map[string]interface{})
-		for propName, propValue := range props {
-			// Skip internal/empty property names
-			if propName == "" {
-				continue
-			}
-
-			prop := map[string]interface{}{
-				"type": "string",
-			}
-
-			if pv, ok := propValue.(map[string]interface{}); ok && pv != nil {
-				if t, ok := pv["type"].(string); ok && t != "" {
-					prop["type"] = t
-				}
-				if desc, ok := pv["description"].(string); ok && desc != "" {
-					prop["description"] = sanitizeJinja2Patterns(desc)
-				}
-				// Support enum if present
-				if enum, ok := pv["enum"].([]interface{}); ok && len(enum) > 0 {
-					prop["enum"] = enum
-				}
-			}
-			newProps[propName] = prop
-		}
-		result["properties"] = newProps
+	// Process properties - ONLY type and description per property
+	rawProps := m["properties"]
+	if rawProps == nil {
+		// If properties is null, return with placeholder
+		return result
 	}
 
-	// Extract required fields
-	if req, ok := m["required"].([]interface{}); ok && req != nil {
-		required := make([]string, 0, len(req))
-		for _, r := range req {
-			if s, ok := r.(string); ok && s != "" {
-				required = append(required, s)
+	propsMap, ok := rawProps.(map[string]interface{})
+	if !ok || propsMap == nil || len(propsMap) == 0 {
+		// If properties is not a map or empty, return with placeholder
+		return result
+	}
+
+	newProps := make(map[string]interface{})
+
+	for propName, pValue := range propsMap {
+		if propName == "" {
+			continue
+		}
+
+		// CRITICAL: Every property MUST be a non-null map with exactly 2 keys
+		// This is what llama.cpp expects and anything else causes .keys() to fail
+		entry := map[string]interface{}{
+			"type":        "string",
+			"description": "parameter",
+		}
+
+		// Try to extract type and description if available
+		if pValue != nil {
+			if pvMap, isMap := pValue.(map[string]interface{}); isMap && pvMap != nil {
+				// Extract type - flatten complex types (array, object) to string for llama.cpp
+				if t, ok := pvMap["type"].(string); ok && t != "" {
+					// Flatten array and object types to string for safety
+					if t == "array" || t == "object" {
+						entry["type"] = "string"
+					} else {
+						entry["type"] = t
+					}
+				}
+				// Extract description
+				if desc, ok := pvMap["description"].(string); ok && desc != "" {
+					entry["description"] = sanitizeJinja2Patterns(desc)
+				}
 			}
 		}
-		result["required"] = required
-	} else if req, ok := m["required"].([]string); ok && req != nil {
+
+		// ABSOLUTELY ensure both keys exist and are non-null strings
+		if entry["type"] == nil || entry["type"] == "" {
+			entry["type"] = "string"
+		}
+		if entry["description"] == nil || entry["description"] == "" {
+			entry["description"] = "parameter"
+		}
+
+		newProps[propName] = entry
+	}
+
+	// CRITICAL: properties must NEVER be empty - Jinja2 template iterates over it
+	if len(newProps) == 0 {
+		newProps["_placeholder"] = map[string]interface{}{
+			"type":        "string",
+			"description": "placeholder parameter",
+		}
+	}
+
+	result["properties"] = newProps
+
+	// Handle required array
+	if req, ok := m["required"].([]interface{}); ok && len(req) > 0 {
+		var reqs []string
+		for _, v := range req {
+			if s, ok := v.(string); ok && s != "" {
+				reqs = append(reqs, s)
+			}
+		}
+		if len(reqs) > 0 {
+			result["required"] = reqs
+		}
+	} else if req, ok := m["required"].([]string); ok && len(req) > 0 {
 		result["required"] = req
 	}
 
 	return result
 }
 
-// normalizeSchema is a compatibility alias for createMinimalSchema for tests
+// normalizeSchema is a compatibility alias for tests.
 func normalizeSchema(input interface{}) interface{} {
 	return createMinimalSchema(input)
 }
@@ -159,26 +223,26 @@ func normalizeSchema(input interface{}) interface{} {
 // ConvertToolsToDefinitions converts tool registry entries to LLM tool definitions
 func ConvertToolsToDefinitions(registry *tools.Registry) []ToolDefinition {
 	var defs []ToolDefinition
+	toolCount := 0
+
 	for _, name := range registry.List() {
 		tool, _ := registry.Get(name)
 
-		var parameters interface{}
+		var parameters map[string]interface{}
 		if tool.RawInputSchema != nil {
 			parameters = createMinimalSchema(tool.RawInputSchema)
 		} else {
+			// Build ultra-safe props for internal tools
 			props := make(map[string]interface{})
 			for pName, p := range tool.InputSchema.Properties {
-				pType := p.Type
-				if pType == "" {
-					pType = "string"
-				}
 				props[pName] = map[string]interface{}{
-					"type": pType,
+					"type":        "string",
+					"description": sanitizeJinja2Patterns(p.Description),
 				}
 			}
 			required := tool.InputSchema.Required
 			if required == nil {
-				required = make([]string, 0)
+				required = []string{}
 			}
 			parameters = map[string]interface{}{
 				"type":       "object",
@@ -187,27 +251,32 @@ func ConvertToolsToDefinitions(registry *tools.Registry) []ToolDefinition {
 			}
 		}
 
-		// Absolute fallback to ensure no null parameters
-		if parameters == nil {
-			parameters = map[string]interface{}{
-				"type":       "object",
-				"properties": make(map[string]interface{}),
-				"required":   make([]string, 0),
-			}
-		}
+		formattedName := strings.ReplaceAll(tool.Name, ".", "_")
 
-		defs = append(defs, ToolDefinition{
+		toolDef := ToolDefinition{
 			Type: "function",
 			Function: Function{
-				Name:        tool.Name,
+				Name:        formattedName,
 				Description: sanitizeJinja2Patterns(tool.Description),
 				Parameters:  parameters,
 			},
-		})
+		}
+
+		// Debug log the first tool to verify schema structure
+		if toolCount == 0 {
+			if jsonData, err := json.MarshalIndent(toolDef, "", "  "); err == nil {
+				slog.Debug("first tool schema", "tool", formattedName, "schema", string(jsonData))
+			}
+		}
+		toolCount++
+
+		defs = append(defs, toolDef)
 	}
 
 	if defs == nil {
 		return []ToolDefinition{}
 	}
+
+	slog.Info("converted tools to definitions", "count", len(defs))
 	return defs
 }

@@ -23,499 +23,228 @@ type MemoryAgent struct {
 	memory    memory.MemoryStore
 	cfg       *config.Config
 	toolDefs  []llm.ToolDefinition
-
 	sessionID string
 }
 
-// NewMemoryAgent creates a new memory-aware agent
-func NewMemoryAgent(
-	llmClient llm.Client,
-	registry *tools.Registry,
-	memStore memory.MemoryStore,
-	cfg *config.Config,
-) Agent {
+func NewMemoryAgent(llmClient llm.Client, registry *tools.Registry, memStore memory.MemoryStore, cfg *config.Config) Agent {
 	return &MemoryAgent{
-		llmClient: llmClient,
-		registry:  registry,
-		memory:    memStore,
-		cfg:       cfg,
-		toolDefs:  llm.ConvertToolsToDefinitions(registry),
+		llmClient: llmClient, registry: registry, memory: memStore, cfg: cfg,
+		toolDefs: llm.ConvertToolsToDefinitions(registry),
 	}
 }
 
-// Process handles a user request with memory context
 func (a *MemoryAgent) Process(ctx context.Context, req *Request) (*Response, error) {
-	slog.Info("memory agent processing request",
-		"user", req.UserID,
-		"channel", req.ChannelID,
-		"message", req.Message,
-	)
-
-	// Ensure session
+	slog.Info("memory agent processing request", "user", req.UserID, "message", req.Message)
 	if err := a.ensureSession(ctx, req); err != nil {
-		slog.Warn("failed to ensure session", "error", err)
+		slog.Warn("session fail", "error", err)
 	}
-
-	// 1. Record incoming user message
 	a.recordChatMessage(ctx, "user", req.Message, req)
 
-	// 2. Search relevant long-term memory
-	memories, err := a.searchMemory(ctx, req.Message, req.ChannelID)
-	if err != nil {
-		slog.Warn("memory search failed", "error", err)
+	history, _ := a.memory.GetSessionObservations(ctx, a.sessionID)
+	sort.Slice(history, func(i, j int) bool { return history[i].CreatedAt.Before(history[j].CreatedAt) })
+	if len(history) > 10 {
+		history = history[len(history)-10:]
 	}
 
-	// 3. Fetch session history (STM)
-	history, err := a.memory.GetSessionObservations(ctx, a.sessionID)
-	if err != nil {
-		slog.Warn("failed to fetch session history", "error", err)
-	} else {
-		// Sort by time
-		sort.Slice(history, func(i, j int) bool {
-			return history[i].CreatedAt.Before(history[j].CreatedAt)
-		})
-		// Limit history to last 10 messages to prevent context bloat
-		if len(history) > 10 {
-			history = history[len(history)-10:]
-		}
-	}
-
-	// 4. Enrich messages with memory context and history
-	messages := a.enrichMessages(req, memories, history)
-
-	// Execute agentic loop
-	content, toolCalls, err := a.runAgentLoop(ctx, req, messages)
+	messages := a.enrichMessages(req, nil, history)
+	content, toolCalls, err := a.runAgentLoop(ctx, req, messages, a.toolDefs)
 	if err != nil {
 		return nil, err
 	}
 
-	// 6. Record tool executions
 	for _, tc := range toolCalls {
 		a.recordToolExecution(ctx, tc, req)
 	}
-
-	// 7. Record assistant response
 	a.recordChatMessage(ctx, "assistant", content, req)
-
-	return &Response{
-		Text:      content,
-		ToolCalls: toolCalls,
-	}, nil
+	return &Response{Text: content, ToolCalls: toolCalls}, nil
 }
 
-func (a *MemoryAgent) searchMemory(ctx context.Context, query, channelID string) (*memory.SearchResult, error) {
-	opts := memory.SearchOptions{
-		Limit:          4, // Increase limit to 4 for better knowledge retrieval
-		MinScore:       0.7,
-		ChannelID:      channelID,
-		IncludeContent: false,
-	}
-
-	return a.memory.Search(ctx, query, opts)
-}
-
-func (a *MemoryAgent) recordChatMessage(ctx context.Context, role, content string, req *Request) {
-	obs := &memory.Observation{
-		Type:      memory.ObservationTypeChatMessage,
-		SessionID: a.sessionID,
-		ChannelID: req.ChannelID,
-		UserID:    req.UserID,
-		Title:     fmt.Sprintf("Chat: %s", role),
-		Content:   content,
-		Metadata: memory.ObservationMetadata{
-			Role: role,
-		},
-	}
-
-	if err := a.memory.Store(ctx, obs); err != nil {
-		slog.Warn("failed to record chat message", "error", err)
-	}
-}
-
-func (a *MemoryAgent) enrichMessages(req *Request, memories *memory.SearchResult, history []*memory.Observation) []llm.Message {
-	// Start with system prompt
-	systemContent := systemPrompt
-
-	// Add LTM context if available
-	if memories != nil && len(memories.Observations) > 0 {
-		var memCtx strings.Builder
-		memCtx.WriteString("\n\n## Relevant Past Context\n")
-		memCtx.WriteString("The following information from past interactions may be relevant:\n\n")
-
-		for _, obs := range memories.Observations {
-			// Skip current session messages in LTM search to avoid duplication
-			if obs.SessionID == a.sessionID {
-				continue
-			}
-			memCtx.WriteString(fmt.Sprintf("- **[%s]** %s (relevance: %.0f%%)\n",
-				obs.CreatedAt.Format("2006-01-02"),
-				obs.Summary,
-				obs.Score*100,
-			))
-		}
-
-		memCtx.WriteString("\nUse this context if helpful, but prioritize current information.\n")
-		systemContent += memCtx.String()
-	}
-
-	messages := []llm.Message{
-		{Role: "system", Content: systemContent},
-	}
-
-	// Add Slack thread context if available (from Slack API)
-	// This is the actual thread content that Eve was mentioned in
-	if len(req.ThreadContext) > 0 {
-		var threadCtx strings.Builder
-		threadCtx.WriteString("## Thread Context (Previous messages in this Slack thread):\n")
-		for _, msg := range req.ThreadContext {
-			threadCtx.WriteString(msg + "\n---\n")
-		}
-		messages = append(messages, llm.Message{
-			Role:    "user",
-			Content: threadCtx.String(),
-		})
-		messages = append(messages, llm.Message{
-			Role:    "assistant",
-			Content: "I've reviewed the thread context above. How can I help with this?",
-		})
-	}
-
-	// Add Conversation History
-	// Track if the current message is already in history to avoid duplication
-	currentMsgInHistory := false
-	for _, obs := range history {
-		role := obs.Metadata.Role
-		if role == "" {
-			continue
-		}
-
-		messages = append(messages, llm.Message{
-			Role:    role,
-			Content: obs.Content,
-		})
-
-		if role == "user" && obs.Content == req.Message {
-			currentMsgInHistory = true
-		}
-	}
-
-	// Always ensure the current message is at the end if not already found in history
-	if !currentMsgInHistory {
-		messages = append(messages, llm.Message{
-			Role:    "user",
-			Content: req.Message,
-		})
-	}
-
-	return messages
-}
-
-func (a *MemoryAgent) selectTools(message string) []llm.ToolDefinition {
-	// Provide all available tools to the LLM to allow dynamic selection.
-	// We no longer use manual keyword filtering to avoid missing relevant tools.
-
-	// Limit to max 22 tools for stable k8s coverage and LLM template safety.
-	const maxTools = 22
-
-	var selected []llm.ToolDefinition
-	if len(a.toolDefs) > maxTools {
-		slog.Warn("too many tools registered, truncating", "total", len(a.toolDefs), "limit", maxTools)
-		selected = a.toolDefs[:maxTools]
-	} else {
-		selected = a.toolDefs
-	}
-
-	slog.Info("providing tools to LLM", "total", len(a.toolDefs), "provided", len(selected))
-	return selected
-}
-
-// containsAny checks if s contains any of the substrings
-func containsAny(s string, substrings []string) bool {
-	for _, sub := range substrings {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-func (a *MemoryAgent) runAgentLoop(ctx context.Context, req *Request, messages []llm.Message) (string, []*ToolCallRecord, error) {
+func (a *MemoryAgent) runAgentLoop(ctx context.Context, req *Request, messages []llm.Message, selectedTools []llm.ToolDefinition) (string, []*ToolCallRecord, error) {
 	var toolCalls []*ToolCallRecord
-
-	// Select relevant tools based on the message content
-	selectedTools := a.selectTools(req.Message)
-
 	maxIterations := 10
+	requireTool := req.Mode == "sre" || isSREAndInfraRelated(req.Message)
+
 	for i := 0; i < maxIterations; i++ {
-		chatReq := &llm.ChatRequest{
-			Messages: messages,
-			Tools:    selectedTools,
-		}
-
-		// Use "auto" tool choice to let the model decide whether to call a tool or chat
-		if len(selectedTools) > 0 {
-			chatReq.ToolChoice = "auto"
-		}
-
+		chatReq := &llm.ChatRequest{Messages: messages, Tools: selectedTools, ToolChoice: "auto"}
 		resp, err := a.llmClient.Chat(ctx, chatReq)
 		if err != nil {
 			return "", toolCalls, fmt.Errorf("llm chat failed: %w", err)
 		}
 
-		// Add assistant message to history
+		nativeTCs := resp.Message.ToolCalls
+		promptTCs := ParseToolCallsFromText(resp.Message.Content)
+		for _, ptc := range promptTCs {
+			nativeTCs = append(nativeTCs, llm.ToolCall{
+				ID:       fmt.Sprintf("mp%d-%x", i, time.Now().UnixNano()),
+				Type:     "function",
+				Function: llm.FunctionCall{Name: ptc.ToolName, Arguments: ptc.Arguments},
+			})
+		}
+
+		if len(nativeTCs) > 0 {
+			// If we already have tool results, don't call more tools - ask for final response
+			if len(toolCalls) > 0 {
+				messages = append(messages, resp.Message)
+				// Respond in user's language
+				finalMsg := "Please respond to the user based on the tool results. No more tool calls needed. Respond in the SAME language the user used."
+				if isKorean(req.Message) {
+					finalMsg = "도구 결과를 바탕으로 사용자에게 응답해주세요. 추가 도구 호출은 필요하지 않습니다."
+				}
+				messages = append(messages, llm.Message{Role: "user", Content: finalMsg})
+				continue
+			}
+
+			resp.Message.Content = StripToolCallMarkers(resp.Message.Content)
+			if resp.Message.Content == "" {
+				resp.Message.Content = "(Tool calling...)"
+			}
+		}
 		messages = append(messages, resp.Message)
 
-		// Check if we have tool calls to process
-		if len(resp.Message.ToolCalls) > 0 {
-			// Continue to tool processing
-		} else {
-			// Genuinely finished
-			slog.Info("memory agent completed", "iterations", i+1)
+		if len(nativeTCs) == 0 {
+			// Detect hallucination patterns - expanded list
+			content := resp.Message.Content
+			isHallucination := strings.Contains(content, "<details>") ||
+				strings.Contains(content, "<summary>") ||
+				strings.Contains(content, "{ \"status\"") ||
+				strings.Contains(content, "{\"status\"") ||
+				strings.Contains(content, "확인해드릴게요") ||
+				strings.Contains(content, "확인해드리겠습니다") ||
+				strings.Contains(content, "확인해볼게요") ||
+				strings.Contains(content, "조회할게요") ||
+				strings.Contains(content, "조회해볼게요") ||
+				strings.Contains(content, "실행할게요") ||
+				strings.Contains(content, "확인하는 중") ||
+				strings.Contains(content, "조회하는 중") ||
+				strings.Contains(content, "kubectl ") ||
+				strings.Contains(content, "```bash") ||
+				strings.Contains(content, "```shell")
+
+			if requireTool && len(selectedTools) > 0 && i < 3 {
+				// Use language-appropriate retry message
+				var retryMsg string
+				if isKorean(req.Message) {
+					if isHallucination {
+						retryMsg = "HALLUCINATION DETECTED. 가짜 데이터나 kubectl 명령어를 출력하지 마세요. 반드시 도구를 호출해야 합니다. 형식: <function=pods_list_in_namespace><parameter=namespace>YOUR_NAMESPACE</parameter></function>"
+					} else {
+						retryMsg = "ERROR: 도구 호출이 감지되지 않았습니다. SRE 요청에는 반드시 도구를 호출해야 합니다. 형식: <function=pods_list_in_namespace><parameter=namespace>YOUR_NAMESPACE</parameter></function>"
+					}
+				} else {
+					if isHallucination {
+						retryMsg = "HALLUCINATION DETECTED. Do not output fake data or kubectl commands. You MUST call a tool. Format: <function=pods_list_in_namespace><parameter=namespace>YOUR_NAMESPACE</parameter></function>"
+					} else {
+						retryMsg = "ERROR: No tool call detected. For SRE requests, you MUST call a tool. Format: <function=pods_list_in_namespace><parameter=namespace>YOUR_NAMESPACE</parameter></function>"
+					}
+				}
+				messages = append(messages, llm.Message{Role: "user", Content: retryMsg})
+				continue
+			}
+			// If still no tool call after retries, return error message instead of hallucination
+			if requireTool && (len(toolCalls) == 0 || isHallucination) {
+				errMsg := "Tool call failed. Please try again."
+				if isKorean(req.Message) {
+					errMsg = "도구 호출에 실패했습니다. 다시 시도해 주세요."
+				}
+				return errMsg, toolCalls, nil
+			}
 			return resp.Message.Content, toolCalls, nil
 		}
 
-		// Process tool calls
-		slog.Info("processing tool calls", "count", len(resp.Message.ToolCalls))
-
-		for _, tc := range resp.Message.ToolCalls {
+		for _, tc := range nativeTCs {
 			start := time.Now()
-			toolResult, success := a.executeTool(ctx, req, tc)
-			duration := time.Since(start)
-
-			messages = append(messages, llm.Message{
-				Role:       "tool",
-				Content:    toolResult,
-				ToolCallID: tc.ID,
-				Name:       tc.Function.Name,
-			})
-
+			toolResult, toolSource, actualName, success := a.executeTool(ctx, req, tc)
+			messages = append(messages, llm.Message{Role: "tool", Content: toolResult, ToolCallID: tc.ID, Name: tc.Function.Name})
 			toolCalls = append(toolCalls, &ToolCallRecord{
-				ToolName: tc.Function.Name,
-				Input:    tc.Function.Arguments,
-				Result:   toolResult,
-				Success:  success,
-				Duration: duration,
+				ToolName: actualName, ToolSource: toolSource, Input: tc.Function.Arguments,
+				Result: toolResult, Success: success, Duration: time.Since(start),
 			})
 		}
 	}
-
-	return "", toolCalls, fmt.Errorf("max iterations reached without completion")
+	return "Max iterations.", toolCalls, nil
 }
 
-func (a *MemoryAgent) executeTool(ctx context.Context, req *Request, tc llm.ToolCall) (string, bool) {
+func (a *MemoryAgent) executeTool(ctx context.Context, req *Request, tc llm.ToolCall) (string, string, string, bool) {
 	toolName := tc.Function.Name
-
-	slog.Info("executing tool",
-		"tool", toolName,
-		"user", req.UserID,
-	)
-
-	// Check if tool exists
 	tool, ok := a.registry.Get(toolName)
 	if !ok {
-		return fmt.Sprintf("Error: Tool '%s' not found", toolName), false
-	}
-
-	// Check permissions for destructive tools
-	if tool.IsDestructive {
-		if !a.cfg.IsUserAllowed(req.UserID) {
-			slog.Warn("unauthorized user attempted destructive operation",
-				"user", req.UserID,
-				"tool", toolName,
-			)
-			return fmt.Sprintf("Error: User not authorized for destructive operation '%s'", toolName), false
-		}
-		if !a.cfg.IsChannelAllowed(req.ChannelID) {
-			slog.Warn("unauthorized channel for destructive operation",
-				"channel", req.ChannelID,
-				"tool", toolName,
-			)
-			return fmt.Sprintf("Error: Channel not authorized for destructive operation '%s'", toolName), false
+		for _, n := range a.registry.List() {
+			if strings.EqualFold(strings.ReplaceAll(n, ".", "_"), toolName) || strings.HasSuffix(strings.ToLower(n), strings.ToLower(toolName)) {
+				if t, found := a.registry.Get(n); found {
+					tool = t
+					ok = true
+					break
+				}
+			}
 		}
 	}
+	if !ok {
+		return fmt.Sprintf("Error: Tool '%s' not found.", toolName), "", toolName, false
+	}
 
-	// Execute the tool
-	result, err := a.registry.Execute(ctx, toolName, json.RawMessage(tc.Function.Arguments))
+	result, err := a.registry.Execute(ctx, tool.Name, json.RawMessage(tc.Function.Arguments))
 	if err != nil {
-		slog.Error("tool execution error", "tool", toolName, "error", err)
-		return fmt.Sprintf("Error executing tool: %v", err), false
+		return fmt.Sprintf("Error: %v", err), tool.Source, tool.Name, false
 	}
 
-	// Format result
-	if result.Success {
-		if result.Data != nil {
-			dataJSON, _ := json.Marshal(result.Data)
-			return fmt.Sprintf("%s\n\nData: %s", result.Output, string(dataJSON)), true
-		}
-		return result.Output, true
+	output := result.Output
+	if result.Data != nil {
+		dataJSON, _ := json.Marshal(result.Data)
+		output = fmt.Sprintf("%s\n\nData: %s", result.Output, string(dataJSON))
 	}
-	return fmt.Sprintf("Error: %s", result.Error), false
+	return output, tool.Source, tool.Name, result.Success
+}
+
+func (a *MemoryAgent) recordChatMessage(ctx context.Context, role, content string, req *Request) {
+	_ = a.memory.Store(ctx, &memory.Observation{
+		Type: memory.ObservationTypeChatMessage, SessionID: a.sessionID, ChannelID: req.ChannelID, UserID: req.UserID,
+		Content: content, Metadata: memory.ObservationMetadata{Role: role},
+	})
 }
 
 func (a *MemoryAgent) recordToolExecution(ctx context.Context, tc *ToolCallRecord, req *Request) {
-	obs := &memory.Observation{
-		Type:      memory.ObservationTypeToolExecution,
-		Category:  extractCategory(tc.ToolName),
-		SessionID: a.sessionID,
-		ChannelID: req.ChannelID,
-		UserID:    req.UserID,
-		Title:     fmt.Sprintf("Tool: %s", tc.ToolName),
-		Content:   tc.Result,
-		Metadata: memory.ObservationMetadata{
-			ToolName:   tc.ToolName,
-			ToolInput:  tc.Input,
-			ToolOutput: tc.Result,
-			Success:    tc.Success,
-			Duration:   tc.Duration.Milliseconds(),
-		},
-		Technologies: extractTechnologies(tc.ToolName, tc.Result),
-	}
-
-	if err := a.memory.Store(ctx, obs); err != nil {
-		slog.Warn("failed to record tool execution", "error", err)
-	}
+	_ = a.memory.Store(ctx, &memory.Observation{
+		Type: memory.ObservationTypeToolExecution, SessionID: a.sessionID, ChannelID: req.ChannelID, UserID: req.UserID,
+		Content: tc.Result, Metadata: memory.ObservationMetadata{ToolName: tc.ToolName, Success: tc.Success},
+	})
 }
 
 func (a *MemoryAgent) ensureSession(ctx context.Context, req *Request) error {
-	// Generate session ID based on channel + thread
-	sessionKey := req.ChannelID
+	id := req.ChannelID
 	if req.ThreadTS != "" {
-		sessionKey += ":" + req.ThreadTS
+		id += ":" + req.ThreadTS
 	}
-
-	a.sessionID = sessionKey
-
-	// Try to get existing session
-	session, err := a.memory.GetSession(ctx, sessionKey)
-	if err != nil || session == nil {
-		// Create new session
-		session = &memory.Session{
-			ID:        sessionKey,
-			StartedAt: time.Now().UTC(),
-			ChannelID: req.ChannelID,
-			UserID:    req.UserID,
-			ThreadTS:  req.ThreadTS,
-		}
-		return a.memory.CreateSession(ctx, session)
+	a.sessionID = id
+	session, _ := a.memory.GetSession(ctx, id)
+	if session == nil {
+		return a.memory.CreateSession(ctx, &memory.Session{ID: id, StartedAt: time.Now().UTC(), ChannelID: req.ChannelID, UserID: req.UserID})
 	}
-
-	// Update existing session
 	session.MessageCount++
 	return a.memory.UpdateSession(ctx, session)
 }
 
-// RecordIncident records an incident to memory
-func (a *MemoryAgent) RecordIncident(ctx context.Context, incident *Incident, req *Request) error {
-	obs := &memory.Observation{
-		Type:      memory.ObservationTypeIncident,
-		Category:  "incident",
-		SessionID: a.sessionID,
-		ChannelID: req.ChannelID,
-		UserID:    req.UserID,
-		Title:     incident.Title,
-		Content:   incident.Description,
-		Metadata: memory.ObservationMetadata{
-			Severity:     incident.Severity,
-			Namespace:    incident.Namespace,
-			Resource:     incident.Resource,
-			ResourceKind: incident.ResourceKind,
-			Resolution:   incident.Resolution,
-			MTTR:         incident.MTTRMinutes,
-		},
-		Technologies: incident.Technologies,
+func (a *MemoryAgent) enrichMessages(req *Request, _ *memory.SearchResult, history []*memory.Observation) []llm.Message {
+	// Build dynamic tool prompt with available tools
+	var toolNames []string
+	for _, n := range a.registry.List() {
+		toolNames = append(toolNames, n)
 	}
+	toolPrompt := GenerateDynamicToolPrompt(toolNames)
 
-	return a.memory.Store(ctx, obs)
+	messages := []llm.Message{{Role: "system", Content: systemPrompt + toolPrompt}}
+	for _, obs := range history {
+		if obs.Metadata.Role != "" {
+			messages = append(messages, llm.Message{Role: obs.Metadata.Role, Content: obs.Content})
+		}
+	}
+	messages = append(messages, llm.Message{Role: "user", Content: req.Message})
+	return messages
 }
 
-// Incident represents an incident to be recorded
-type Incident struct {
-	Title        string
-	Description  string
-	Severity     string
-	Namespace    string
-	Resource     string
-	ResourceKind string
-	Resolution   string
-	MTTRMinutes  int64
-	Technologies []string
-}
-
-// GetToolsSummary returns a summary of available tools
 func (a *MemoryAgent) GetToolsSummary() string {
 	var sb strings.Builder
-	sb.WriteString("*Available Tools*\n\n")
-
-	for _, name := range a.registry.List() {
-		tool, _ := a.registry.Get(name)
-		marker := ""
-		if tool.IsDestructive {
-			marker = " 🔴"
-		}
-		sb.WriteString(fmt.Sprintf("• `%s`%s - %s\n", tool.Name, marker, tool.Description))
+	for _, n := range a.registry.List() {
+		t, _ := a.registry.Get(n)
+		sb.WriteString("- " + t.Name + "\n")
 	}
-
 	return sb.String()
-}
-
-// Helper functions
-
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
-
-func extractCategory(toolName string) string {
-	parts := strings.Split(toolName, ".")
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return "general"
-}
-
-func extractTechnologies(toolName, output string) []string {
-	techs := make(map[string]bool)
-
-	// Extract from tool name
-	if strings.HasPrefix(toolName, "kubernetes.") {
-		techs["kubernetes"] = true
-	}
-	if strings.HasPrefix(toolName, "github.") {
-		techs["github"] = true
-	}
-	if strings.HasPrefix(toolName, "argo.") {
-		techs["argo"] = true
-	}
-
-	// Extract from output
-	keywords := map[string]string{
-		"deployment": "kubernetes",
-		"pod":        "kubernetes",
-		"service":    "kubernetes",
-		"configmap":  "kubernetes",
-		"secret":     "kubernetes",
-		"ingress":    "kubernetes",
-		"prometheus": "prometheus",
-		"grafana":    "grafana",
-		"oomkilled":  "memory-issue",
-		"crashloop":  "crashloop",
-		"postgres":   "postgresql",
-		"redis":      "redis",
-		"kafka":      "kafka",
-	}
-
-	lowerOutput := strings.ToLower(output)
-	for keyword, tech := range keywords {
-		if strings.Contains(lowerOutput, keyword) {
-			techs[tech] = true
-		}
-	}
-
-	result := make([]string, 0, len(techs))
-	for tech := range techs {
-		result = append(result, tech)
-	}
-	return result
 }

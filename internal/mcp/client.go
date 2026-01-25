@@ -111,6 +111,16 @@ func (c *Client) Initialize(ctx context.Context) error {
 	return nil
 }
 
+// ServerName returns the name of the MCP server.
+func (c *Client) ServerName() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.serverInfo != nil && c.serverInfo.Name != "" {
+		return c.serverInfo.Name
+	}
+	return c.serverURL
+}
+
 // ListTools retrieves the available tools from the MCP server.
 func (c *Client) ListTools(ctx context.Context) ([]*tools.Tool, error) {
 	// Add a small retry loop for ListTools in case server is still transitioning
@@ -150,6 +160,7 @@ func (c *Client) ListTools(ctx context.Context) ([]*tools.Tool, error) {
 			Description:    mcpT.Description,
 			InputSchema:    eveSchema,
 			RawInputSchema: mcpT.InputSchema, // Store original for LLM
+			Source:         c.ServerName(),   // Track WHICH MCP server provided this
 			Handler: func(ctx context.Context, input json.RawMessage) (*tools.Result, error) {
 				return c.CallTool(ctx, mcpT.Name, input)
 			},
@@ -165,6 +176,9 @@ func (c *Client) CallTool(ctx context.Context, name string, input json.RawMessag
 	if err := json.Unmarshal(input, &args); err != nil {
 		return nil, fmt.Errorf("invalid tool input: %w", err)
 	}
+
+	// Debug log the actual arguments being sent
+	slog.Debug("MCP tool call", "tool", name, "arguments", args, "raw_input", string(input))
 
 	callReq := mcpCallToolRequest{
 		Name:      name,
@@ -187,6 +201,9 @@ func (c *Client) CallTool(ctx context.Context, name string, input json.RawMessag
 			output.WriteString(content.Text)
 		}
 	}
+
+	// Debug log the response
+	slog.Debug("MCP tool response", "tool", name, "isError", callResp.IsError, "output", output.String())
 
 	if callResp.IsError {
 		return tools.NewErrorResult(output.String()), nil

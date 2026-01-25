@@ -19,13 +19,18 @@ import (
 )
 
 func main() {
-	// Configure structured logging
+	// Configure structured logging with environment variable support
+	logLevel := slog.LevelInfo
+	if os.Getenv("DEBUG") == "true" || os.Getenv("DEBUG") == "1" {
+		logLevel = slog.LevelDebug
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	}))
 	slog.SetDefault(logger)
 
-	slog.Info("eve starting", "version", "0.3.0", "mode", "mcp-proxy")
+	slog.Info("eve starting", "version", "0.3.0", "mode", "mcp-proxy", "log_level", logLevel.String())
 
 	// Load configuration
 	cfg, err := config.Load()

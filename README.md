@@ -52,7 +52,21 @@ graph TD
 
 ## 📸 Demo
 
-![Eve SRE Agent Demo](docs/assets/screenshot.png)
+Eve operates in **two distinct modes**, automatically detecting which mode to use based on your message:
+
+### 🔧 SRE Mode (Infrastructure & Operations)
+When you ask about pods, deployments, logs, or any infrastructure topic, Eve immediately calls the appropriate MCP tools to fetch real data. No hallucination, no fake outputs.
+
+> *"fft-os 네임스페이스 pod 상태 확인해줘"* → Calls `pods_list_in_namespace` tool
+
+![Eve SRE Agent Demo - SRE](docs/assets/screenshot-sre-mode.png)
+
+### 💬 Chat Mode (Casual Conversation)
+For greetings, general questions, or casual chat, Eve responds naturally without calling any tools. It matches your language (Korean/English) automatically.
+
+> *"안녕! 오늘 기분 어때?, grpc가 뭐야?"* → Friendly conversation, no tools
+
+![Eve SRE Agent Demo - Chat](docs/assets/screenshot-chat-mode.png)
 
 ---
 

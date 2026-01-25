@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/restack/eve/internal/agent"
 	"github.com/restack/eve/internal/config"
@@ -24,6 +26,10 @@ type Handler struct {
 	agent    agent.Agent
 	registry *tools.Registry
 	cfg      *config.Config
+
+	// Event deduplication to prevent processing the same event multiple times
+	seenEvents   map[string]time.Time
+	seenEventsMu sync.RWMutex
 }
 
 // NewHandler creates a new Slack handler.
@@ -39,16 +45,20 @@ func NewHandler(cfg *config.Config, ag agent.Agent, registry *tools.Registry) (*
 	)
 
 	return &Handler{
-		client:   client,
-		socket:   socket,
-		agent:    ag,
-		registry: registry,
-		cfg:      cfg,
+		client:     client,
+		socket:     socket,
+		agent:      ag,
+		registry:   registry,
+		cfg:        cfg,
+		seenEvents: make(map[string]time.Time),
 	}, nil
 }
 
 // Run starts the Socket Mode event loop.
 func (h *Handler) Run(ctx context.Context) error {
+	// Start cleanup goroutine for seen events cache
+	go h.cleanupSeenEvents(ctx)
+
 	go func() {
 		for evt := range h.socket.Events {
 			h.handleEvent(ctx, evt)
@@ -61,6 +71,40 @@ func (h *Handler) Run(ctx context.Context) error {
 	}()
 
 	return h.socket.Run()
+}
+
+// markEventSeen records an event as processed. Returns false if already seen.
+func (h *Handler) markEventSeen(eventKey string) bool {
+	h.seenEventsMu.Lock()
+	defer h.seenEventsMu.Unlock()
+
+	if _, exists := h.seenEvents[eventKey]; exists {
+		return false
+	}
+	h.seenEvents[eventKey] = time.Now()
+	return true
+}
+
+// cleanupSeenEvents periodically removes old entries from the seen events cache.
+func (h *Handler) cleanupSeenEvents(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.seenEventsMu.Lock()
+			cutoff := time.Now().Add(-10 * time.Minute)
+			for key, ts := range h.seenEvents {
+				if ts.Before(cutoff) {
+					delete(h.seenEvents, key)
+				}
+			}
+			h.seenEventsMu.Unlock()
+		}
+	}
 }
 
 func (h *Handler) handleEvent(ctx context.Context, evt socketmode.Event) {
@@ -92,6 +136,13 @@ func (h *Handler) handleEvent(ctx context.Context, evt socketmode.Event) {
 }
 
 func (h *Handler) handleSlashCommand(ctx context.Context, cmd slack.SlashCommand) {
+	// Deduplicate: use trigger_id as unique key for slash commands
+	eventKey := fmt.Sprintf("slash:%s", cmd.TriggerID)
+	if !h.markEventSeen(eventKey) {
+		slog.Debug("duplicate slash command ignored", "command", cmd.Command, "trigger", cmd.TriggerID)
+		return
+	}
+
 	slog.Info("received slash command",
 		"command", cmd.Command,
 		"text", cmd.Text,
@@ -104,14 +155,23 @@ func (h *Handler) handleSlashCommand(ctx context.Context, cmd slack.SlashCommand
 
 	// Create agent request from slash command
 	message := cmd.Text
-	if cmd.Command == "/k8s" {
-		message = "kubernetes " + message
+	mode := "auto"
+
+	switch cmd.Command {
+	case "/k8s", "/sre":
+		mode = "sre"
+		if !strings.HasPrefix(strings.ToLower(message), "k8s") {
+			message = "kubernetes " + message
+		}
+	case "/chat", "/ask":
+		mode = "chat"
 	}
 
 	req := &agent.Request{
 		UserID:    cmd.UserID,
 		ChannelID: cmd.ChannelID,
 		Message:   message,
+		Mode:      mode,
 	}
 
 	// Process through agent
@@ -142,6 +202,13 @@ func (h *Handler) handleEventsAPI(ctx context.Context, event slackevents.EventsA
 }
 
 func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMentionEvent) {
+	// Deduplicate: use channel + timestamp as unique key
+	eventKey := fmt.Sprintf("mention:%s:%s", event.Channel, event.TimeStamp)
+	if !h.markEventSeen(eventKey) {
+		slog.Debug("duplicate mention event ignored", "channel", event.Channel, "ts", event.TimeStamp)
+		return
+	}
+
 	slog.Info("received mention",
 		"text", event.Text,
 		"user", event.User,
@@ -211,17 +278,56 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 		return
 	}
 
-	// Build final response with tool call information
-	finalText := resp.Text
+	// Prepare blocks for the response
+	var blocks []slack.Block
+
+	// 1. Add tool call info if available
 	if len(resp.ToolCalls) > 0 {
-		toolSummary := "\n\n---\n*🛠 Executed Tools:*"
 		for _, tc := range resp.ToolCalls {
-			toolSummary += fmt.Sprintf("\n• `%s` (Input: `%s`)", tc.ToolName, tc.Input)
+			sourceInfo := ""
+			if tc.ToolSource != "" {
+				sourceInfo = fmt.Sprintf(" with *%s*", tc.ToolSource)
+			}
+
+			statusEmoji := "✅"
+			if !tc.Success {
+				statusEmoji = "❌"
+			}
+
+			// Use context block for the "Called MCP tool" line
+			blocks = append(blocks, slack.NewContextBlock(
+				"",
+				slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("> Called MCP tool `%s`%s  %s", tc.ToolName, sourceInfo, statusEmoji), false, false),
+			))
 		}
-		finalText += toolSummary
 	}
 
-	h.sendThreadedMessage(event.Channel, replyThread, finalText)
+	// 2. Add the main response text
+	if resp.Text != "" {
+		blocks = append(blocks, slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", formatForSlack(resp.Text), false, false),
+			nil, nil,
+		))
+	}
+
+	// 3. Fallback to raw text if no blocks (shouldn't happen with valid response)
+	if len(blocks) == 0 {
+		h.sendThreadedMessage(event.Channel, replyThread, "I'm sorry, I couldn't generate a response.")
+		return
+	}
+
+	// Send as blocks
+	options := []slack.MsgOption{slack.MsgOptionBlocks(blocks...)}
+	if replyThread != "" {
+		options = append(options, slack.MsgOptionTS(replyThread))
+	}
+
+	_, _, err = h.client.PostMessage(event.Channel, options...)
+	if err != nil {
+		slog.Error("failed to send block message", "error", err)
+		// Fallback to text if blocks fail
+		h.sendThreadedMessage(event.Channel, replyThread, resp.Text)
+	}
 }
 
 func truncate(s string, maxLen int) string {
@@ -234,6 +340,13 @@ func truncate(s string, maxLen int) string {
 func (h *Handler) handleDirectMessage(ctx context.Context, event *slackevents.MessageEvent) {
 	// Ignore bot's own messages
 	if event.BotID != "" {
+		return
+	}
+
+	// Deduplicate: use channel + timestamp as unique key
+	eventKey := fmt.Sprintf("dm:%s:%s", event.Channel, event.TimeStamp)
+	if !h.markEventSeen(eventKey) {
+		slog.Debug("duplicate DM event ignored", "channel", event.Channel, "ts", event.TimeStamp)
 		return
 	}
 
@@ -260,7 +373,47 @@ func (h *Handler) handleDirectMessage(ctx context.Context, event *slackevents.Me
 		return
 	}
 
-	h.sendMessage(event.Channel, resp.Text)
+	// Prepare blocks for the response
+	var blocks []slack.Block
+
+	// 1. Add tool call info
+	if len(resp.ToolCalls) > 0 {
+		for _, tc := range resp.ToolCalls {
+			sourceInfo := ""
+			if tc.ToolSource != "" {
+				sourceInfo = fmt.Sprintf(" with *%s*", tc.ToolSource)
+			}
+
+			statusEmoji := "✅"
+			if !tc.Success {
+				statusEmoji = "❌"
+			}
+
+			blocks = append(blocks, slack.NewContextBlock(
+				"",
+				slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("> Called MCP tool `%s`%s  %s", tc.ToolName, sourceInfo, statusEmoji), false, false),
+			))
+		}
+	}
+
+	// 2. Add main text
+	if resp.Text != "" {
+		blocks = append(blocks, slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", formatForSlack(resp.Text), false, false),
+			nil, nil,
+		))
+	}
+
+	if len(blocks) == 0 {
+		h.sendMessage(event.Channel, "No response generated.")
+		return
+	}
+
+	_, _, err = h.client.PostMessage(event.Channel, slack.MsgOptionBlocks(blocks...))
+	if err != nil {
+		slog.Error("failed to send block message in DM", "error", err)
+		h.sendMessage(event.Channel, resp.Text)
+	}
 }
 
 func (h *Handler) handleInteraction(ctx context.Context, callback slack.InteractionCallback) {
