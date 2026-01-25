@@ -5,7 +5,7 @@
 Instead of hardcoding tools, Eve acts as a **Supervisor Agent** that dynamically discovers capabilities from external providers (Kubernetes, GitHub, Argo, etc.) and orchestrates them through natural language.
 
 <p align="center">
-<img width="40%" alt="image" src="docs/assets/eve-n-slime.png" />
+<img width="40%" alt="image" src="docs/assets/eve-with-tech-slimes.png" />
 </p>
 
 ---
@@ -59,14 +59,14 @@ When you ask about pods, deployments, logs, or any infrastructure topic, Eve imm
 
 > *"fft-os 네임스페이스 pod 상태 확인해줘"* → Calls `pods_list_in_namespace` tool
 
-![Eve SRE Agent Demo - SRE](docs/assets/screenshot-sre-mode.png)
+![Eve SRE Agent Demo - SRE](docs/assets/eve-sre-mode.png)
 
 ### 💬 Chat Mode (Casual Conversation)
 For greetings, general questions, or casual chat, Eve responds naturally without calling any tools. It matches your language (Korean/English) automatically.
 
 > *"안녕! 오늘 기분 어때?, grpc가 뭐야?"* → Friendly conversation, no tools
 
-![Eve SRE Agent Demo - Chat](docs/assets/screenshot-chat-mode.png)
+![Eve SRE Agent Demo - Chat](docs/assets/eve-chat-mode.png)
 
 ---
 
