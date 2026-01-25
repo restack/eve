@@ -104,8 +104,21 @@ func (a *BaseAgent) Process(ctx context.Context, req *Request) (*Response, error
 
 	messages := []llm.Message{
 		{Role: "system", Content: systemPrompt + toolPrompt},
-		{Role: "user", Content: req.Message},
 	}
+
+	// Add thread context if available (messages from the Slack thread)
+	if len(req.ThreadContext) > 0 {
+		var contextBuilder strings.Builder
+		contextBuilder.WriteString("## Thread Context (previous messages in this thread):\n")
+		for i, msg := range req.ThreadContext {
+			contextBuilder.WriteString(fmt.Sprintf("[%d] %s\n", i+1, msg))
+		}
+		contextBuilder.WriteString("\n---\nUse the above thread context to understand what the user is referring to.\n")
+		messages = append(messages, llm.Message{Role: "user", Content: contextBuilder.String()})
+		messages = append(messages, llm.Message{Role: "assistant", Content: "I understand the thread context. I'll use it to answer your question."})
+	}
+
+	messages = append(messages, llm.Message{Role: "user", Content: req.Message})
 
 	content, toolCalls, err := a.runAgentLoop(ctx, req, messages)
 	if err != nil {
@@ -128,8 +141,17 @@ func (a *BaseAgent) runAgentLoop(ctx context.Context, req *Request, messages []l
 
 		calls := ParseToolCallsFromText(resp.Message.Content)
 
-		// Hallucination Nudge: If SRE request but no [TOOL:...] markers
-		if len(calls) == 0 && (req.Mode == "sre" || isSREAndInfraRelated(req.Message)) {
+		// If we already executed tools, return the response (it's the analysis)
+		if len(toolCalls) > 0 && len(calls) == 0 {
+			content := StripToolCallMarkers(resp.Message.Content)
+			if content == "" {
+				content = "분석 결과를 생성할 수 없습니다. 다시 시도해 주세요."
+			}
+			return content, toolCalls, nil
+		}
+
+		// Hallucination Nudge: If SRE request but no [TOOL:...] markers (and no tools executed yet)
+		if len(calls) == 0 && len(toolCalls) == 0 && (req.Mode == "sre" || isSREAndInfraRelated(req.Message)) {
 			messages = append(messages, resp.Message)
 
 			// Detect hallucination patterns - expanded list
@@ -160,7 +182,7 @@ func (a *BaseAgent) runAgentLoop(ctx context.Context, req *Request, messages []l
 			}
 
 			// If still no tool call after retries, return error message instead of hallucination
-			if len(toolCalls) == 0 || isHallucination {
+			if isHallucination {
 				return "도구 호출에 실패했습니다. 다시 시도해 주세요.", toolCalls, nil
 			}
 			return resp.Message.Content, toolCalls, nil
@@ -185,9 +207,12 @@ func (a *BaseAgent) runAgentLoop(ctx context.Context, req *Request, messages []l
 			// Execute
 			res, src, _, ok := a.executeTool(ctx, req, actualName, ptc.Arguments)
 
+			// Preprocess tool result to highlight errors/warnings
+			processedRes := PreprocessToolResult(actualName, res)
+
 			messages = append(messages, llm.Message{
 				Role:    "user",
-				Content: fmt.Sprintf("Observation from %s:\n%s", ptc.ToolName, res),
+				Content: fmt.Sprintf("Observation from %s:\n%s\n\n%s", ptc.ToolName, processedRes, buildPostToolAnalysisPrompt(req.Message)),
 			})
 
 			toolCalls = append(toolCalls, &ToolCallRecord{

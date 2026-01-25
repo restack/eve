@@ -63,9 +63,16 @@ func (a *MemoryAgent) runAgentLoop(ctx context.Context, req *Request, messages [
 	var toolCalls []*ToolCallRecord
 	maxIterations := 10
 	requireTool := req.Mode == "sre" || isSREAndInfraRelated(req.Message)
+	askedForAnalysis := false // Track if we've already asked for post-tool analysis
 
 	for i := 0; i < maxIterations; i++ {
-		chatReq := &llm.ChatRequest{Messages: messages, Tools: selectedTools, ToolChoice: "auto"}
+		// After tool execution is complete, don't offer tools anymore to force text response
+		chatTools := selectedTools
+		if len(toolCalls) > 0 && askedForAnalysis {
+			chatTools = nil // No more tools after analysis prompt
+		}
+
+		chatReq := &llm.ChatRequest{Messages: messages, Tools: chatTools, ToolChoice: "auto"}
 		resp, err := a.llmClient.Chat(ctx, chatReq)
 		if err != nil {
 			return "", toolCalls, fmt.Errorf("llm chat failed: %w", err)
@@ -81,16 +88,29 @@ func (a *MemoryAgent) runAgentLoop(ctx context.Context, req *Request, messages [
 			})
 		}
 
+		// If we've already executed tools and asked for analysis, return the text response
+		if len(toolCalls) > 0 && askedForAnalysis {
+			slog.Debug("post-tool analysis response", "raw_content", truncateForLog(resp.Message.Content, 500))
+			content := StripToolCallMarkers(resp.Message.Content)
+			slog.Debug("post-tool analysis stripped", "content", truncateForLog(content, 500))
+			if content == "" {
+				slog.Warn("LLM returned empty analysis, retrying once more")
+				// Try one more time with a simpler prompt
+				messages = append(messages, resp.Message)
+				messages = append(messages, llm.Message{Role: "user", Content: "위의 도구 결과를 보고 핵심 내용만 요약해서 알려주세요. 반드시 텍스트로 응답하세요."})
+				continue
+			}
+			return content, toolCalls, nil
+		}
+
 		if len(nativeTCs) > 0 {
 			// If we already have tool results, don't call more tools - ask for final response
 			if len(toolCalls) > 0 {
-				messages = append(messages, resp.Message)
-				// Respond in user's language
-				finalMsg := "Please respond to the user based on the tool results. No more tool calls needed. Respond in the SAME language the user used."
-				if isKorean(req.Message) {
-					finalMsg = "도구 결과를 바탕으로 사용자에게 응답해주세요. 추가 도구 호출은 필요하지 않습니다."
-				}
+				// Don't add the LLM's response (which contains tool calls) - it creates confusing history
+				// Just ask for analysis directly
+				finalMsg := buildPostToolAnalysisPrompt(req.Message)
 				messages = append(messages, llm.Message{Role: "user", Content: finalMsg})
+				askedForAnalysis = true
 				continue
 			}
 
@@ -153,7 +173,9 @@ func (a *MemoryAgent) runAgentLoop(ctx context.Context, req *Request, messages [
 		for _, tc := range nativeTCs {
 			start := time.Now()
 			toolResult, toolSource, actualName, success := a.executeTool(ctx, req, tc)
-			messages = append(messages, llm.Message{Role: "tool", Content: toolResult, ToolCallID: tc.ID, Name: tc.Function.Name})
+			// Preprocess tool result to highlight errors/warnings for better LLM analysis
+			processedResult := PreprocessToolResult(actualName, toolResult)
+			messages = append(messages, llm.Message{Role: "tool", Content: processedResult, ToolCallID: tc.ID, Name: tc.Function.Name})
 			toolCalls = append(toolCalls, &ToolCallRecord{
 				ToolName: actualName, ToolSource: toolSource, Input: tc.Function.Arguments,
 				Result: toolResult, Success: success, Duration: time.Since(start),
@@ -231,6 +253,20 @@ func (a *MemoryAgent) enrichMessages(req *Request, _ *memory.SearchResult, histo
 	toolPrompt := GenerateDynamicToolPrompt(toolNames)
 
 	messages := []llm.Message{{Role: "system", Content: systemPrompt + toolPrompt}}
+
+	// Add thread context if available (messages from the Slack thread)
+	if len(req.ThreadContext) > 0 {
+		var contextBuilder strings.Builder
+		contextBuilder.WriteString("## Thread Context (previous messages in this thread):\n")
+		for i, msg := range req.ThreadContext {
+			contextBuilder.WriteString(fmt.Sprintf("[%d] %s\n", i+1, msg))
+		}
+		contextBuilder.WriteString("\n---\nUse the above thread context to understand what the user is referring to.\n")
+		messages = append(messages, llm.Message{Role: "user", Content: contextBuilder.String()})
+		messages = append(messages, llm.Message{Role: "assistant", Content: "I understand the thread context. I'll use it to answer your question."})
+	}
+
+	// Add session history from memory
 	for _, obs := range history {
 		if obs.Metadata.Role != "" {
 			messages = append(messages, llm.Message{Role: obs.Metadata.Role, Content: obs.Content})

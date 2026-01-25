@@ -213,6 +213,8 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 		"text", event.Text,
 		"user", event.User,
 		"channel", event.Channel,
+		"thread_ts", event.ThreadTimeStamp,
+		"event_ts", event.TimeStamp,
 	)
 
 	// Remove the mention from the text
@@ -240,6 +242,7 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 	// Fetch thread context ONLY if this is a reply in an existing thread
 	var threadContext []string
 	if event.ThreadTimeStamp != "" {
+		slog.Info("fetching thread context", "thread_ts", event.ThreadTimeStamp)
 		// Get previous messages in this thread
 		params := &slack.GetConversationRepliesParameters{
 			ChannelID: event.Channel,
@@ -250,6 +253,7 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 		if err != nil {
 			slog.Warn("failed to fetch thread replies", "error", err)
 		} else {
+			slog.Info("fetched thread messages", "count", len(msgs))
 			for _, m := range msgs {
 				// Skip the current message
 				if m.Timestamp == event.TimeStamp {
@@ -257,10 +261,12 @@ func (h *Handler) handleMention(ctx context.Context, event *slackevents.AppMenti
 				}
 				// Format: "message"
 				threadContext = append(threadContext, m.Text)
+				slog.Debug("thread message", "ts", m.Timestamp, "text_preview", truncate(m.Text, 100))
 			}
+			slog.Info("thread context prepared", "context_count", len(threadContext))
 		}
 	} else {
-		slog.Info("new thread started, skipping previous channel context")
+		slog.Info("no thread_ts - this is a new thread or top-level mention", "event_ts", event.TimeStamp)
 	}
 
 	req := &agent.Request{
